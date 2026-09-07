@@ -1,4 +1,4 @@
-# 🏯 蓉游智体 · Chengdu Travel AI Agent
+﻿# 🏯 蓉游智体 · Chengdu Travel AI Agent
 
 ![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python)
 ![Node](https://img.shields.io/badge/Node.js-19+-green?logo=node.js)
