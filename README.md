@@ -203,7 +203,7 @@ Query → VectorIndexRetriever (BGE 1024维 Top10)
 | 层级 | 机制 | 示例 |
 |------|------|------|
 | **程序级** | `validate_plan()` Python 硬编码 8 条规则 | R-001: 熊猫基地强制 Day1 上午 08:00-12:00，原安排自动移至下午 |
-| **Prompt 级** | 53 条规则注入 `PLAN_PROMPT` 的 `{hard_rules}` 占位 | 武侯祠+锦里必须同半天、都江堰+青城山必须同一天、Leshan 大佛排除 ≤3 日行程 |
+| **Prompt 级** | MySQL hard_rules 53 条注入 `PLAN_PROMPT` 的 `{hard_rules}` 占位 | 武侯祠+锦里必须同半天、都江堰+青城山必须同一天 |
 | **校验级** | Plan Worker 生成后自动调 `validate_plan()` 修正 | 违规记录到 `plan["rules_applied"]` 供调试 |
 
 **程序级 8 条规则**（见 [utils.py](backend/app/agents/utils.py)）：
@@ -223,7 +223,9 @@ Query → VectorIndexRetriever (BGE 1024维 Top10)
 - Nearby Worker 用 **Haversine 公式**（地球半径 6371km）计算球面距离，按半径过滤周边景点（市区 3km / 默认 5km / 郊区 10km）
 - 行程规划时 `transit_matrix` 作为 `PLAN_PROMPT` 的 `{transit_matrix}` 占位注入，确保 LLM 生成的通勤时间真实可查
 
-### 🧠 5. 长期用户画像记忆（LTM）
+### 🧠 5. 用户画像记忆（LTM · 架构预留）
+
+> ⚠️ 以下功能**已完成 schema + config 预留，但业务代码尚未实现**。当前 LTM 表为空，记忆功能是架构设计的一部分，计划在后续迭代中补齐。
 
 **MySQL 硬槽位** `user_profiles` 表（9 个字段）：
 | 字段 | 类型 | 说明 |
@@ -235,13 +237,15 @@ Query → VectorIndexRetriever (BGE 1024维 Top10)
 | `must_include_json` | JSON | 必去景点 |
 | `must_exclude_json` | JSON | 黑名单景点 |
 | `notes` | Text | 自由备注 |
-| `ltm_chunk_count` | Integer | 累计 LTM 提取次数 |
+| `ltm_chunk_count` | Integer | 累计 LTM 提取次数（防频繁覆盖） |
 | `ltm_last_extract_at` | DateTime | 最近一次提取时间 |
 
-**Milvus 向量记忆** `user_ltm_v1` 集合：
-- 用户偏好（如"喜欢小众景点""拍照好看优先"）以向量形式存储
+**Milvus 向量记忆** `user_ltm_v1` 集合（已在 config 预留 `MILVUS_COLLECTION_LTM`）：
+- 用户偏好（如"喜欢小众景点"）以向量形式存储
 - 跨会话持久化，语义去重阈值 0.92
-- LTM 提取失败时写入 `dlq`（DeadLetter 死信队列），支持异步重试
+- 配套 `dlq` 死信队列（archive / ltm_extract / notify 三阶段）
+
+**当前状态**：ORM 模型 + 配置字段已就绪，但 `finalize_prompt` 注入、LTM 提取写入、dlq 异步重试等业务逻辑待实现。
 
 ---
 
@@ -408,7 +412,7 @@ Supervisor 不是单一节点，而是**同一节点承担两轮职责**，通�
 
 ### Plan Worker — 硬规则注入 + 程序级校验
 
-- **SQL 动态查询**：MySQL 查询 hard_rules（按 priority ASC 排序）+ transit_matrix（same_region=1 LIMIT 20）+ itinerary_templates
+- **SQL 动态查询**：MySQL 查询 hard_rules（按 priority ASC 排序）+ transit_matrix（same_region=1 LIMIT 20）+ itinerary_templates（⚠️ 表尚未创建，代码 try/except 降级为"无行程模板"）
 - 三项数据作为 `{hard_rules}` / `{transit_matrix}` / `{templates}` 占位注入 `PLAN_PROMPT`
 - LLM 输出 JSON 后，**立即调 `validate_plan()` 做程序级校验**
 - 违规记录到 `plan["rules_applied"]`（如 `R-002(violated:day1都江堰与市区混排)`）
@@ -582,15 +586,15 @@ LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`�
 
 | 表 | 说明 | 运行时 |
 |----|------|--------|
-| `spots` | 1554 景点（坐标/等级/票价/开放时间/描述/贴士/文化） | 每次查询 |
-| `foods` | 80+ 美食 | Advice Worker |
-| `food_shops` | 美食店铺 | Advice Worker |
-| `avoid_rules` | 250+ 避坑规则 | Advice Worker |
-| `hard_rules` | 53 条硬规则 | Plan Worker Prompt |
-| `transit_matrix` | 190,158 通勤对 | Plan Worker Prompt |
-| `chat_sessions` | 冷备归档（Checkpointer 热备） | 异步归档 |
-| `user_profiles` | LTM 硬槽位（9 字段 Enum/JSON） | finalize_prompt 注入 |
-| `dlq` | 死信队列（archive / ltm_extract / notify） | 异步重试 |
+| `spots` | 1554 景点（坐标/等级/票价/开放时间/描述/贴士/文化） | ✅ 每次查询 |
+| `foods` | 80+ 美食 | ✅ Advice Worker |
+| `food_shops` | 1624 家美食店铺 | ⚠️ schema-only（ORM 已定义，无 Worker 查询） |
+| `avoid_rules` | 250+ 避坑规则 | ✅ Advice Worker |
+| `hard_rules` | 53 条硬规则 | ✅ Plan Worker Prompt |
+| `transit_matrix` | 190,158 通勤对 | ✅ Plan Worker Prompt |
+| `chat_sessions` | 会话冷备归档 | ⚠️ schema-only（ORM 已定义，无归档写入代码） |
+| `user_profiles` | LTM 硬槽位（9 字段 Enum/JSON） | ⚠️ schema-only（ORM 已定义，无 finalize_prompt 注入） |
+| `dlq` | 死信队列（archive / ltm_extract / notify） | ⚠️ schema-only（ORM 已定义，无写入代码） |
 
 **联网搜索降级策略**：`web_search()` 基于 DuckDuckGo HTML 搜索，国内不稳定时失败返回空字符串，Agent 自动退化为纯本地 RAG 回答。
 
@@ -634,7 +638,7 @@ LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`�
 | `rule_content` | TEXT | 规则内容（注入 Prompt） |
 | `priority` | INT | 数字越小越高，Plan Worker 按 ASC 排序注入 |
 
-### user_profiles — LTM 硬槽位
+### user_profiles — LTM 硬槽位（⚠️ schema-only，无业务代码读写）
 
 | 字段 | 类型 | Enum 取值 |
 |------|------|----------|
@@ -644,7 +648,7 @@ LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`�
 | `allergies_json` / `must_include_json` / `must_exclude_json` | JSON | 忌口 / 必去 / 黑名单 |
 | `ltm_chunk_count` | INT | 累计 LTM 提取次数（防频繁覆盖） |
 
-### dlq — 死信队列
+### dlq — 死信队列（⚠️ schema-only，无写入代码）
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -842,7 +846,7 @@ npm run dev  # http://localhost:5173
 | 维度 | 现状 | 问题 |
 |------|------|------|
 | **并发** | 单进程 Uvicorn + SqliteSaver | SQLite WAL 在高并发下仍有锁争用，应切 RedisSaver 或 PostgresSaver |
-| **鉴权** | JWT 已实现但前端未对接 | `/api/chat` 路由未强制 token，任何人可调用 |
+| **鉴权** | JWT 仅在 config 预留字段，无 middleware | `/api/chat` 路由未强制 token，任何人可调用 |
 | **数据新鲜度** | 种子 CSV 一次性导入 | 高德数据、票价、开放时间会变，缺少定时增量更新 |
 | **前端** | Semi UI + Vite | 组件未抽离 Hook、无状态管理库（Zustand/Redux），对话历史用 localStorage |
 | **测试覆盖** | 3 个 pytest 文件 | 只有 Agent / RAG / Worker 基本路径，缺少 API 集成测试 + 前端 E2E |
