@@ -302,7 +302,94 @@ Query → VectorIndexRetriever (BGE 1024维 Top10)
 
 ---
 
-## 🔄 Checkpointer 工厂模式
+## 🧩 LLM 多模型工厂
+
+`llm_client.py` 预创建 6 个 ChatOpenAI 实例，`get_llm(mode, deep_think)` 按前端模式 + 深度思考开关选择：
+
+| 实例 | 模型 | 温度 | Streaming | 用途 |
+|------|------|------|-----------|------|
+| `llm` | deepseek-chat | 0.3 | ✅ | 快速模式 Supervisor / QA Worker |
+| `llm_pro` | deepseek-v4-pro | 0.7 | ✅ | 专家模式 |
+| `llm_reasoner` | deepseek-reasoner | 0.7 | ✅ | 深度思考，输出带 `<think>...</think>` |
+| `llm_vision` | deepseek-v4-flash-vision-exp | 0.3 | ✅ | 识图模式 |
+| `llm_json` | deepseek-chat | 0.1 | ❌ | Supervisor 意图分类（non-streaming + JSON Mode） |
+| `llm_worker` | deepseek-chat | 0.3 | ❌ | Advice/Plan Worker（non-streaming，不泄漏流式响应） |
+
+**选择优先级**：`deep_think` > `mode`（reasoner 覆盖 expert/fast）
+
+**关键约束**：`llm_json` 和 `llm_worker` 必须 non-streaming —— 否则 Supervisor 的 JSON 输出或 Worker 的卡片内容会泄漏到聊天流式响应中。
+
+---
+
+## 🎭 Supervisor 两轮职责 + 5 条特殊路径
+
+Supervisor 不是单一节点，而是**同一节点承担两轮职责**，通过 `state["phase"]` 和 `worker_results` 是否为空自动切换：
+
+```
+首轮（phase="routing" 或 worker_results 为空）
+  ├─ 识图模式（有 image）→ 跳过 Worker，直接进入 summary 用 vision 模型
+  ├─ 问候语 → 直接回答，不派发 Worker
+  ├─ 天气查询 → 调高德天气 API + LLM 润色
+  └─ 正常意图分类 → llm_json 输出 JSON → Send 并行派发 Worker
+
+次轮（phase="summary" 或 worker_results 非空）
+  ├─ 识图模式 → vision 模型多模态分析
+  ├─ 无 Worker 结果（如问候被直接处理）→ 用 LLM 软知识回答
+  └─ 正常汇总 → smart_search 联网追加 → SUPERVISOR_SUMMARY_PROMPT 整合 → <think> 解析
+```
+
+**深度思考 `<think>` 标签解析**：reasoner 模型返回的 raw 输出含 `<think>思考内容</think>最终回答`，Supervisor 用正则提取中间的 reasoning 字段和最终的 final_answer，分别推 SSE 事件。部分模型 reasoning 在 `response.reasoning_content` 独立字段，做了双路径兼容。
+
+**降级策略**：Supervisor 汇总 LLM 调用失败时，直接拼接 Worker 原始结果作为 final_answer（不丢失信息）。
+
+**意图分类降级**：JSON 解析失败或 Worker 列表为空时，默认走 `qa_worker`。
+
+---
+
+## 👷 四个 Worker 实现细节
+
+### QA Worker — RAG + 软知识回退
+
+- 优先 `build_query_engine().aquery(user_msg)` 调用 RAG
+- 检索为空（"知识库中暂无" / "empty response"）→ **回退到 LLM 软知识回答**
+- 软知识回退时强制输出数字序号列表（禁止 #、**、`、|、--- 等符号），说明是参考信息
+
+### Plan Worker — 硬规则注入 + 程序级校验
+
+- **SQL 动态查询**：MySQL 查询 hard_rules（按 priority ASC 排序）+ transit_matrix（same_region=1 LIMIT 20）+ itinerary_templates
+- 三项数据作为 `{hard_rules}` / `{transit_matrix}` / `{templates}` 占位注入 `PLAN_PROMPT`
+- LLM 输出 JSON 后，**立即调 `validate_plan()` 做程序级校验**
+- 违规记录到 `plan["rules_applied"]`（如 `R-002(violated:day1都江堰与市区混排)`）
+- MySQL 查询失败降级为"无规则/无通勤/无模板"模式，不阻断生成
+
+### Advice Worker — 六维建议 + 避坑规则注入
+
+- 从 MySQL 查 avoid_rules（250+ 条），注入 `ADVICE_PROMPT` 的 `{avoid_rules}` 占位
+- 按 6 个维度组织回答：🌤 天气季节 / 💰 预算参考 / 🚇 交通出行 / ⚠️ 避坑提醒 / 🍜 美食推荐 / 📸 拍照攻略
+- 输出禁止表格、**加粗**、代码块、--- 分隔线
+
+### Nearby Worker — Haversine 球面距离 + 动态半径
+
+- Supervisor 先调 LLM 做 **景点名识别 + 半径决策**（输出 JSON `{"spot_name": "宽窄巷子", "radius_km": 5}`）
+- 半径策略：市区景点 3km / 默认 5km / 郊区（都江堰/青城山）10km
+- 从 MySQL 查目标景点经纬度 → Haversine 公式算球面距离 → 过滤半径内景点
+- Haversine 参数：地球半径 R = 6371.0 km
+
+---
+
+## 🔧 工具层
+
+| 工具 | 实现 | 降级策略 |
+|------|------|---------|
+| **高德天气** | `httpx.get` → `restapi.amap.com/v3/weather/weatherInfo`，extensions=all 返回 3 天预报 | AMAP_API_KEY 未配置时直接返回"暂不可用" |
+| **DuckDuckGo 联网搜索** | `requests.post` → `html.duckduckgo.com/html/`，正则提取 `result__a` 链接 + `result__snippet` 摘要 | 国内网络不稳定，失败返回空字符串，Agent 退化为纯 RAG |
+| **天气关键词判断** | 23 个关键词（天气/气温/下雨/带伞/防晒...），命中则跳过 Worker 直接调天气 API | — |
+
+**Supervisor 智能搜索**：`smart_search=True` 时，Worker 结果汇总后调 `web_search(user_msg)`，结果追加到 `【联网搜索结果】` 段落，再一起送入 SUMMARY_PROMPT。
+
+---
+
+## 🔴 Checkpointer 工厂模式
 
 `get_checkpointer_async()` 按 `CHECKPOINT_BACKEND` 环境变量一行切换后端：
 
@@ -363,6 +450,8 @@ LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`�
 - 返回取消函数，切换会话 / 关闭页面前 abort
 
 **Markdown 渲染约定**：后端 `_clean_markdown()` 清洗掉 `**加粗**`、`代码标记`、`--- 分隔线`，前端用 Semi UI 的 Typography 直接渲染剩余的标题/列表/表格/引用块。
+
+**Vite SSE 代理**（`vite.config.js`）：前端 `/api/*` → `http://localhost:8000/*`，`proxyReq` 阶段注入 `X-Accel-Buffering: no` 禁用 Nginx 缓冲（SSE 必需，否则 Token 会攒一批才推到前端）。`allowedHosts: true` + `host: 0.0.0.0` 允许穿透工具访问。
 
 ---
 
