@@ -72,29 +72,29 @@ graph TD
 
 ## 🧰 技术栈
 
-| 层级 | 技术 | 版本 | 用途 |
-|------|------|------|------|
-| ⚡ **后端** | ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi) | 0.115 | ASGI Web 框架，类型安全路由 |
-| | ![Uvicorn](https://img.shields.io/badge/Uvicorn-0.30-404D59) | 0.30 | 异步 ASGI 服务器 |
-| | ![Pydantic](https://img.shields.io/badge/Pydantic-2.9-E96464?logo=pydantic) | 2.9 | Settings + 数据校验 |
-| | ![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0-DD0000?logo=sqlalchemy) | 2.0 | ORM 与 MySQL 连接 |
-| 🤖 **Agent** | ![LangGraph](https://img.shields.io/badge/LangGraph-0.2-1C3F94?logo=langchain) | 0.2 | StateGraph + Send API 并行调度 |
-| | ![LangChain](https://img.shields.io/badge/LangChain-0.3-121DAA?logo=langchain) | 0.3 | LLM 抽象 / Runnable / 回调 |
-| | ![LangSmith](https://img.shields.io/badge/LangSmith-✅-121DAA?logo=langchain) | - | 全链路 Trace 可观测性 |
-| | DeepSeek | V4-Pro / Flash | LLM 推理（多模型切换） |
-| 📚 **RAG** | ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-✅-00B365) | - | QueryEngine / Retriever |
-| | ![Milvus](https://img.shields.io/badge/Milvus-Lite-00A0FF?logo=milvus) | 3.0 | 本地向量存储（零服务端依赖） |
-| | BAAI/bge-large-zh | 1.5 | 1024 维中文嵌入模型 |
-| | bge-reranker-large | - | 重排提升召回精度 |
-| | BM25 | rank_bm25 | 稀疏检索 + 向量融合 |
-| 🖥️ **前端** | ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react) | 19 | UI 框架 |
-| | ![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite) | 8 | 构建工具 |
-| | ![Semi UI](https://img.shields.io/badge/Semi_UI-✅-165DFF) | 2.103 | 组件库 |
-| | ![SSE.js](https://img.shields.io/badge/SSE.js-✅-42A5F5) | 2.8 | 流式响应 |
-| 💾 **数据** | ![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql) | 8.0 | 景点 / 美食 / 通勤矩阵持久化 |
-| | ![Redis](https://img.shields.io/badge/Redis-5-DC382D?logo=redis) | 5 | 缓存加速层 |
-| | SqliteSaver | - | LangGraph 跨重启 Checkpointer |
-| | Loguru | 0.7 | 结构化日志 |
+| 层级 | 技术 · 版本 | 用途 |
+|------|------------|------|
+| ⚡ **后端** | ![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi) | ASGI Web 框架，类型安全路由 |
+| | ![Uvicorn](https://img.shields.io/badge/Uvicorn-0.30-404D59) | 异步 ASGI 服务器 |
+| | ![Pydantic](https://img.shields.io/badge/Pydantic-2.9-E96464?logo=pydantic) | Settings + 数据校验 |
+| | ![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0-DD0000?logo=sqlalchemy) | ORM 与 MySQL 连接 |
+| 🤖 **Agent** | ![LangGraph](https://img.shields.io/badge/LangGraph-0.2-1C3F94?logo=langchain) | StateGraph + Send API 并行调度 |
+| | ![LangChain](https://img.shields.io/badge/LangChain-0.3-121DAA?logo=langchain) | LLM 抽象 / Runnable / 回调 |
+| | ![LangSmith](https://img.shields.io/badge/LangSmith-✅-121DAA?logo=langchain) | 全链路 Trace 可观测性 |
+| | DeepSeek (V4-Pro / Flash) | LLM 推理（多模型切换） |
+| 📚 **RAG** | ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-✅-00B365) | QueryEngine / Retriever |
+| | ![Milvus](https://img.shields.io/badge/Milvus-Lite-3.0-00A0FF?logo=milvus) | 本地向量存储（零服务端依赖） |
+| | BAAI/bge-large-zh (1.5) | 1024 维中文嵌入模型 |
+| | bge-reranker-large | 重排提升召回精度 |
+| | BM25 (rank_bm25) | 稀疏检索 + 向量融合 |
+| 🖥️ **前端** | ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react) | UI 框架 |
+| | ![Vite](https://img.shields.io/badge/Vite-8-646CFF?logo=vite) | 构建工具 |
+| | ![Semi UI](https://img.shields.io/badge/Semi_UI-2.103-165DFF) | 组件库 |
+| | ![SSE.js](https://img.shields.io/badge/SSE.js-2.8-42A5F5) | 流式响应 |
+| 💾 **数据** | ![MySQL](https://img.shields.io/badge/MySQL-8.0-4479A1?logo=mysql) | 景点 / 美食 / 通勤矩阵持久化 |
+| | ![Redis](https://img.shields.io/badge/Redis-5-DC382D?logo=redis) | 缓存加速层 |
+| | SqliteSaver | LangGraph 跨重启 Checkpointer |
+| | Loguru (0.7) | 结构化日志 |
 
 ---
 
