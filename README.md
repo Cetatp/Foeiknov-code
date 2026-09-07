@@ -254,31 +254,49 @@ POST /chat → Supervisor 意图分类
 
 ## ⚙️ 配置中心（Pydantic Settings）
 
-`config.py` 用 `BaseSettings` 实现类型安全的单例配置，`.env` 文件注入 + 环境变量覆盖。全项目 `from app.config import settings` 统一访问。
+`config.py` 用 `BaseSettings` 实现类型安全的单例配置。**为什么用 Pydantic Settings 而不是 yaml/json/toml**：三个理由——类型安全（`MYSQL_PORT: int` 不是字符串 3306）、环境变量自动覆盖（`.env` 不存在时从系统环境变量读，CI/CD 直接注入）、全项目单例（`from app.config import settings` 一行搞定，不传 config 参数）。
 
-| 分组 | 关键配置 | 默认值 | 说明 |
-|------|---------|--------|------|
+```python
+# SettingsConfigDict — 三个关键设计决策
+model_config = SettingsConfigDict(
+    env_file=".../.env",          # .env 文件路径
+    extra="ignore",               # .env 里多写了字段不报错（向后兼容）
+    case_sensitive=True,          # 区分大小写，避免 MYSQL_HOST vs mysql_host 混淆
+)
+```
+
+**Milvus Lite 自动切换**：`MILVUS_DB_PATH` 字段一个值决定两种模式——填 `"127.0.0.1:19530"` → Standalone 远程连接；填 `"data/milvus.db"` → Milvus Lite 本地文件存储。`is_milvus_lite` @property 检测 `.db` 后缀，`milvus_uri` @property 自动转换为正确的 URI 格式。本地开发用 Lite（零依赖），生产部署改环境变量切 Standalone。
+
+**派生属性（@property）**——为什么不直接存字符串：
+
+| 属性 | 计算逻辑 | 为什么不直接存 |
+|------|---------|---------------|
+| `mysql_url` | `mysql+pymysql://user:pass@host:port/db?charset=utf8mb4` | 密码变了不用改 URL，只改 `MYSQL_PASSWORD` |
+| `redis_url` | 有密码时 `redis://:pass@host`，无密码时 `redis://host` | 自动处理密码前缀（Redis URL 密码前要加 `:`） |
+| `is_milvus_lite` | `MILVUS_DB_PATH.endswith(".db")` | 一个字段切两种模式，不用单独的 `MILVUS_MODE` |
+| `milvus_uri` | Lite 返回文件路径，Standalone 返回 `http://host:port` | 适配 MilvusVectorStore 两种连接方式 |
+| `langsmith_enabled` | `LANGCHAIN_TRACING_V2.lower() in ("true", "1", "yes")` | 兼容 `.env` 字符串和系统环境变量 |
+
+**完整配置表**（按代码顺序）：
+
+| 分组 | 配置 | 默认值 | 说明 |
+|------|------|--------|------|
 | **LLM** | `DEEPSEEK_MODEL` | `deepseek-chat` | 快速模式 |
 | | `DEEPSEEK_MODEL_PRO` | `deepseek-v4-pro` | 专家模式 |
 | | `DEEPSEEK_MODEL_REASONER` | `deepseek-reasoner` | 深度思考（带 `<think>`） |
 | | `DEEPSEEK_MODEL_VISION` | `deepseek-v4-flash-vision-exp` | 识图模式 |
+| | `DEEPSEEK_TEMPERATURE` | `0.3` | 默认温度，各 Worker 可覆盖 |
 | **高德** | `AMAP_API_KEY` | `""` | 天气 + 通勤矩阵计算 |
 | **MySQL** | `MYSQL_DB` | `chengdu_travel` | 9 张表 |
-| **Milvus** | `MILVUS_DB_PATH` | `127.0.0.1:19530` | Standalone 地址，`.db` 后缀自动切 Lite |
+| **Milvus** | `MILVUS_DB_PATH` | `127.0.0.1:19530` | `.db` 后缀自动切 Lite |
 | | `MILVUS_COLLECTION_SPOTS` | `chengdu_spots` | RAG 集合 |
-| | `MILVUS_COLLECTION_LTM` | `user_ltm_v1` | LTM 用户画像集合 |
+| | `MILVUS_COLLECTION_LTM` | `user_ltm_v1` | LTM 用户画像集合（schema-only） |
 | | `MILVUS_DIM` | `1024` | BGE 向量维度 |
 | **LTM** | `LTM_DEDUP_THRESHOLD` | `0.92` | 语义去重阈值 |
 | **Embedding** | `EMBED_MODEL_NAME` | `BAAI/bge-large-zh-v1.5` | 中文嵌入 |
 | | `RERANKER_MODEL_NAME` | `BAAI/bge-reranker-large` | 重排器 |
 | **Checkpoint** | `CHECKPOINT_BACKEND` | `sqlite` | 可选 memory/redis/postgres |
-| **LangSmith** | `LANGCHAIN_TRACING_V2` | `true` | 全链路追踪开关 |
-
-**派生属性**（`@property`）：
-- `mysql_url` → `mysql+pymysql://user:pass@host:port/db?charset=utf8mb4`
-- `redis_url` → `redis://[:pass]@host:port/db`（有密码时带 `:` 前缀）
-- `is_milvus_lite` → `MILVUS_DB_PATH.endswith(".db")`
-- `milvus_uri` → Lite 返回文件路径，Standalone 返回 `http://host:port`
+| **LangSmith** | `LANGCHAIN_TRACING_V2` | `"true"` | 全链路追踪开关 |
 
 ---
 
@@ -400,9 +418,28 @@ event: end             → Supervisor 汇总完成，推最终 Markdown
 
 ## 🔌 API 接口协议
 
+### FastAPI lifespan 启动流程
+
+`main.py` 用 `@asynccontextmanager` 做启动预热和关闭清理。**为什么要预热**：BGE 嵌入模型首次加载需要 30 秒，如果在第一个用户请求时才加载，第一个用户会等 30 秒白屏。预热把这个成本转移到启动阶段。
+
+```
+启动顺序（三个 try 块，任何一个失败都不阻断启动）：
+1. MySQL SELECT 1 → 验证连接池可用
+2. import llm → 验证 DeepSeek API Key 已配置
+3. _ensure_settings() → 把 BGE Embedding 绑定到 LlamaIndex Settings（关键！）
+   否则第一个 Worker 调 RAG 时，Settings._embed_model 还是 None
+   → LlamaIndex 尝试自动解析为 OpenAI Embedding → 炸掉
+```
+
+**CORS 设计决策**：`allow_origins=["*"]` + `allow_credentials=False`。为什么不用精确白名单——Vite proxy 模式下浏览器不会发 CORS（前端和后端同源），但穿透工具（如 Postman 直连）会发。`["*"]` 放开，`credentials=False` 配合（`*` 和 `credentials=True` 在 FastAPI 中不能同时用，浏览器会拒绝携带 Cookie）。
+
 ### `GET /health` — 全链路健康检查
 
-逐项探测 MySQL / Milvus / LLM API Key / Checkpointer / Redis，前端可据此做连接状态指示灯。
+逐项探测 MySQL / Milvus / LLM API Key / Checkpointer / Redis，前端可据此做连接状态指示灯。**Milvus 探测方式**：Lite 模式检查 `.db` 文件是否存在；Standalone 模式查 `list_collections()`。**LLM 探测**：只检查 `DEEPSEEK_API_KEY` 是否非空，不实际调 API（省 Token）。
+
+```bash
+curl http://localhost:8000/health
+```
 
 ```json
 {
@@ -425,13 +462,9 @@ event: end             → Supervisor 汇总完成，推最终 Markdown
 
 支持关键词模糊匹配（spot_name / address）、级别过滤（5A/4A/3A）、区域过滤（成华区/武侯区...）、分页（limit 默认 20，最大 200），按 rating DESC + spot_level DESC 排序。
 
-| 参数 | 类型 | 说明 |
-|------|------|------|
-| `keyword` | query | 模糊搜索景点名或地址 |
-| `spot_level` | query | 级别过滤 |
-| `area_tag` | query | 区域过滤 |
-| `limit` | query | 每页数量，默认 20 |
-| `offset` | query | 偏移量 |
+```bash
+curl "http://localhost:8000/api/spots?keyword=熊猫&spot_level=4A&limit=5"
+```
 
 ### `GET /api/spots/{spot_id}` — 景点详情
 
@@ -439,16 +472,40 @@ event: end             → Supervisor 汇总完成，推最终 Markdown
 
 ### `POST /api/chat` — SSE 流式对话
 
-唯一的 Agent 入口。请求体：
+**唯一的 Agent 入口**。请求体：
 
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `message` | string | 用户问题 |
-| `session_id` | string | 会话 ID（多会话隔离） |
-| `mode` | enum | `fast` / `expert` / `vision` |
-| `deep_think` | bool | 是否开启深度思考（reasoner 模型） |
-| `smart_search` | bool | 是否联网搜索（DuckDuckGo HTML） |
-| `image` | string | 图片 base64 dataURL（vision 模式） |
+```bash
+curl -N -X POST http://localhost:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  -d '{
+    "message": "我想规划 3 天行程",
+    "session_id": "user_abc123",
+    "mode": "expert",
+    "deep_think": false,
+    "smart_search": false
+  }'
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| `message` | string | ✅ | 用户问题 |
+| `session_id` | string | ✅ | 会话 ID（多会话隔离，Checkpointer 持久化用） |
+| `mode` | enum | ❌ | `fast`(默认) / `expert` / `vision` |
+| `deep_think` | bool | ❌ | 开启深度思考 → reasoner 模型（带 `<think>` 标签） |
+| `smart_search` | bool | ❌ | 联网搜索（DuckDuckGo HTML，可能失败） |
+| `image` | string | ❌ | 图片 base64 dataURL（vision 模式） |
+
+**SSE 连接生命周期**：
+
+```
+POST /chat → FastAPI 验证请求体 → Lifespan 已预热
+  → Supervisor 意图分类（可能走旁路）
+    → Send API 派发 Worker（并行执行）
+      → Worker 完成推 structure_ready
+    → Supervisor 汇总（可能调 smart_search）
+  → 推 end 事件 → 连接关闭
+```
 
 ---
 
@@ -523,31 +580,6 @@ event: end             → Supervisor 汇总完成，推最终 Markdown
 **选择优先级**：`deep_think` > `mode`（reasoner 覆盖 expert/fast）
 
 **关键约束**：`llm_json` 和 `llm_worker` 必须 non-streaming —— 否则 Supervisor 的 JSON 输出或 Worker 的卡片内容会泄漏到聊天流式响应中。
-
----
-
-## 🎭 Supervisor 两轮职责 + 5 条特殊路径
-
-Supervisor 不是单一节点，而是**同一节点承担两轮职责**，通过 `state["phase"]` 和 `worker_results` 是否为空自动切换：
-
-```
-首轮（phase="routing" 或 worker_results 为空）
-  ├─ 识图模式（有 image）→ 跳过 Worker，直接进入 summary 用 vision 模型
-  ├─ 问候语 → 直接回答，不派发 Worker
-  ├─ 天气查询 → 调高德天气 API + LLM 润色
-  └─ 正常意图分类 → llm_json 输出 JSON → Send 并行派发 Worker
-
-次轮（phase="summary" 或 worker_results 非空）
-  ├─ 识图模式 → vision 模型多模态分析
-  ├─ 无 Worker 结果（如问候被直接处理）→ 用 LLM 软知识回答
-  └─ 正常汇总 → smart_search 联网追加 → SUPERVISOR_SUMMARY_PROMPT 整合 → <think> 解析
-```
-
-**深度思考 `<think>` 标签解析**：reasoner 模型返回的 raw 输出含 `<think>思考内容</think>最终回答`，Supervisor 用正则提取中间的 reasoning 字段和最终的 final_answer，分别推 SSE 事件。部分模型 reasoning 在 `response.reasoning_content` 独立字段，做了双路径兼容。
-
-**降级策略**：Supervisor 汇总 LLM 调用失败时，直接拼接 Worker 原始结果作为 final_answer（不丢失信息）。
-
-**意图分类降级**：JSON 解析失败或 Worker 列表为空时，默认走 `qa_worker`。
 
 ---
 
@@ -691,32 +723,43 @@ def haversine(lon1, lat1, lon2, lat2):
 
 ## 🔧 工具层
 
-| 工具 | 实现 | 降级策略 |
-|------|------|---------|
-| **高德天气** | `httpx.get` → `restapi.amap.com/v3/weather/weatherInfo`，extensions=all 返回 3 天预报 | AMAP_API_KEY 未配置时直接返回"暂不可用" |
-| **DuckDuckGo 联网搜索** | `requests.post` → `html.duckduckgo.com/html/`，正则提取 `result__a` 链接 + `result__snippet` 摘要 | 国内网络不稳定，失败返回空字符串，Agent 退化为纯 RAG |
-| **天气关键词判断** | 23 个关键词（天气/气温/下雨/带伞/防晒...），命中则跳过 Worker 直接调天气 API | — |
+### 高德天气——为什么选它不选 OpenWeatherMap
 
-**Supervisor 智能搜索**：`smart_search=True` 时，Worker 结果汇总后调 `web_search(user_msg)`，结果追加到 `【联网搜索结果】` 段落，再一起送入 SUMMARY_PROMPT。
+**选择理由**：高德 API 对成都做过本地化，返回的是中文天气描述（"多云"而非"cloudy"），且 `extensions="all"` 一次返回 3 天预报（含白天/夜间温度差），对旅游行程规划比 OpenWeatherMap 的 16 天预报更精准。价格方面，高德个人开发者每天 5000 次免费额度，完全够用。
 
----
+```
+GET https://restapi.amap.com/v3/weather/weatherInfo
+    ?key=settings.AMAP_API_KEY
+    &city=510100          ← 成都 ADCODE，硬编码在 amap_weather.py
+    &extensions=all       ← base=实况单天 / all=预报3天
+    &output=JSON
+```
 
-## 🛡️ validate_plan 8 条硬规则程序级实现
+**返回解析**：高德 API 返回 JSON `status != "1"` 时表示失败（配额用尽 / Key 无效），不抛异常，而是返回 `"天气查询失败：{info}"`。`WEATHER_MAP` 兜底映射处理高德可能返回的英文/代码天气现象（sunny→晴）。
 
-`utils.py` 的 `validate_plan(plan)` 深拷贝入参后逐条检查，结果写入 `plan["rules_applied"]`。与 Prompt 注入形成**双保险**——LLM 可能漏看 Prompt 里的规则，但 Python 代码不会。
+**调用链路**：用户问"成都明天下雨吗" → Supervisor 23 个 `WEATHER_KEYWORDS` 命中 → **不派发任何 Worker** → `get_weather("成都", "all")` 拿到 3 天预报 → LLM 润色成"明天白天多云转小雨，记得带伞" → 直接返回。**这个旁路跳过了 Send API 派发、RAG 检索和 Supervisor 汇总，一条 150ms 的 HTTP 请求 + 一次 LLM 调用完成。**
 
-| 编号 | 规则 | 类型 | 实现要点 |
-|------|------|------|---------|
-| **R-001** | 熊猫基地必须 Day1 7:30-12:00 | 🔴 **强制覆盖**（最后执行） | 原安排挪到下午或记录到 `original_spot` 字段，保留用户意图 |
-| R-002 | 都江堰+青城山必须同天，不与市区混排 | 🟡 检测 | 遍历每天 slots，关键词匹配"都江堰/青城山"+"宽窄/锦里/春熙/武侯祠/杜甫草堂" |
-| R-003 | 武侯祠+锦里必须同半天（一墙之隔） | 🟡 检测 | 检查 morning/afternoon 是否同时包含两个景点 |
-| R-004 | 杜甫草堂+金沙遗址同半天（车程 15 分钟） | 🟡 检测 | 同上 |
-| R-005 | 金沙/川博周一闭馆 | 🟡 检测 | `weekday() == 0` 时排除"金沙/四川博物院/川博" |
-| R-006 | 每日景点 ≤ 3 个 | 🟡 检测 | 统计非 reserved_keys 的 slot 数 |
-| R-007 | 每日通勤 ≤ 180 分钟 | 🟡 检测 | `transit_minutes > 180` |
-| R-008 | 亲子/老人团避免西岭雪山（3000m+） | 🟡 检测 | `group_type in ("亲子","老人","家庭")` + "西岭雪山" |
+### DuckDuckGo HTML 搜索——为什么不用 SerpAPI/Bing API
 
-**执行顺序关键**：R-001 放在最后执行——它是**强制覆盖型**规则，会修改 plan 结构；其他 7 条是**检测型**，只记录不修改。如果先执行 R-001，它插入熊猫基地后，后面的检测规则会误报新插入内容。
+**选择理由**：DuckDuckGo HTML 版**完全免费**（不需要 API Key），虽然国内不稳定（约 30% 概率超时/被拦截），但降级成本为零——返回空字符串，Supervisor 不追加搜索结果，Agent 自动退化为纯本地 RAG 回答。作为"增强时效性"的可选开关（`smart_search=True`），30% 的不稳定率完全可接受。
+
+**实现细节**（`web_search.py`）：
+```python
+requests.post("https://html.duckduckgo.com/html/",
+              data={"q": query}, timeout=15)
+# 正则提取: result__a 链接 + result__snippet 摘要
+# 清理 uddg= 跳转链接 → 真实 URL
+# 最多返回 max_results=5 条，每条格式:
+# **标题**\n真实URL\n摘要
+```
+
+**为什么用同步 `requests` 而不是异步 `httpx`**：DuckDuckGo 在国内不稳定，`requests` 阻塞 15 秒比 `httpx.AsyncClient` 超时更可控——Sync 调用会阻塞当前事件循环吗？不会，因为 `smart_search` 是在 Supervisor 汇总 Worker 结果**之后**才调用的，此时 Worker 已经全部完成，当前 event loop 没有其他异步任务在跑。
+
+### smart_search 完整链路
+
+不是所有请求都联网搜索。触发条件：前端传 `smart_search: true` → Supervisor summary 阶段检测到 → **在 Worker 结果汇总后、送入 SUMMARY_PROMPT 之前**，调 `web_search(user_msg)` → 结果追加到 `【联网搜索结果】` 段落 → 再一起送入 `SUPERVISOR_SUMMARY_PROMPT` 做最终整合。
+
+降级：网络失败 → `web_search()` 返回 `""` → Supervisor 不追加任何搜索结果 → 纯 Worker 结果汇总。**不返回 500，不影响正常 RAG 回答**。
 
 ---
 
@@ -995,19 +1038,6 @@ FastAPI 依赖注入 `get_db()`：请求 yield SessionLocal，finally 自动 clo
 
 ---
 
-## 📊 数据规模
-
-| 数据 | 数量 | 说明 |
-|------|------|------|
-| 景点种子 | **1,554** | 含坐标、等级、开放时间、票价 |
-| 美食种子 | **80+** | 含推荐菜品、人均消费 |
-| 避坑规则 | **250+** | 景点/交通/通用三类 |
-| 硬规则 | **53** | 行程强制约束 |
-| 通勤矩阵 | **190,158** | 景点对通勤时间/距离 |
-| RAG Query Variants | **12,600+** | 覆盖描述/贴士/文化上下文 |
-
----
-
 ## 📁 项目结构
 
 ```
@@ -1061,112 +1091,6 @@ chengdu-travel-agent/
 │       └── api/chatApi.js     # SSE 客户端
 └── README.md
 ```
-
----
-
-## 🧹 Supervisor 完整实现细节
-
-### 问候语识别（不走 Worker）
-
-`nodes.py` 硬编码了 30 个问候/闲聊关键词，短消息（≤10 字符）命中直接返回固定回答，不消耗 LLM Token：
-
-```python
-GREETING_PATTERNS = [
-    "你好", "您好", "hi", "hello", "hey", "在吗", "在不在",
-    "你是谁", "你叫什么", "介绍一下你自己", "你能做什么", "你会什么",
-    "谢谢", "感谢", "thanks", "thank you",
-    "再见", "拜拜", "bye",
-    "早上好", "下午好", "晚上好",
-]
-```
-
-自我介绍返回 4 项能力清单（📖 查询景点 / 📋 行程规划 / 📍 周边推荐 / 💡 六维建议），告别返回"祝你在成都玩得开心 🎉"。
-
-### 天气查询旁路（不派发 Worker）
-
-23 个天气关键词（`WEATHER_KEYWORDS`）命中 → `get_weather("成都", "all")` 调高德 API 拿到 3 天预报 → LLM 润色成友好回答。降级：API Key 未配置 → "天气查询暂不可用（未配置高德 API Key）"；LLM 失败 → 直接返回原始天气数据字符串。
-
-**高德天气 API 细节**：
-- `CHENGDU_ADCODE = "510100"`（成都城市编码）
-- `httpx.get(timeout=10)` 带 10 秒超时
-- `extensions="base"` 实况天气（单天）vs `extensions="all"` 预报（3 天）
-- `WEATHER_MAP` 兜底映射：sunny→晴 / cloudy→多云 / overcast→阴 / rain→雨 / snow→雪 / fog→雾 / haze→霾
-
-### 意图分类后的合法性校验
-
-Supervisor 意图分类输出 JSON 后，做两步清洗：
-1. `dict.fromkeys()` 去重（防止 LLM 重复输出同一个 Worker）
-2. `[w for w in workers if w in VALID_WORKERS]` 合法性校验（`VALID_WORKERS = {"qa_worker", "plan_worker", "advice_worker", "nearby_worker"}`）
-3. 最终兜底：清洗后为空 → 默认 `["qa_worker"]`
-
-### 识图模式（跳过 Worker 直接汇总）
-
-两个触发点：
-- **首轮 routing**：`state["image"]` 有值 → `phase` 直接设为 `"summary"`，`next_workers=[]`，跳过 Worker 派发
-- **次轮 summary**：`image` 有值 → 调 `get_llm("vision")` 用 vision 模型做多模态分析，HumanMessage content 为 `[{"type": "text"}, {"type": "image_url", "image_url": {"url": image}}]`
-
-### _clean_markdown 清洗逻辑
-
-`nodes.py` 和 `chat_routes.py` 各有一份相同的 `_clean_markdown()`，保留结构、删除前端不渲染的标记：
-
-| 保留 | 删除 |
-|------|------|
-| `## 标题` / `- 列表` / `1. 列表` | `**加粗**` |
-| `\| 表格分隔符` / `> 引用` | 行内 `*`（非列表前缀） |
-| emoji / `○ 子项` / 空行 | `` `代码` `` |
-| | `--- / *** / ___` 分隔线行 |
-
-额外处理：`\n{3,}` 压缩为 `\n\n`，`strip()` 去首尾空白。
-
----
-
-## 🔐 SSE 流式事件完整实现
-
-### thread_id 唯一策略
-
-每次请求生成 `thread_id = {session_id}_{timestamp_ms}_{uuid4_hex_8}`，例如 `default_1744032000000_a3f9b2c1`。**跨请求永不复用同一个 thread_id**，避免 Checkpointer 恢复上一次的 `phase="summary"` / `worker_results` 导致 Supervisor 跳过 Worker 直接汇总旧结果。
-
-### initial_state 重置
-
-```python
-initial_state = {
-    "phase": "routing",       # 无 reducer，直接覆盖 checkpoint 旧值
-    "final_answer": "",        # 无 reducer，直接覆盖
-    "worker_results": {},      # merge_results reducer 遇空字典清空
-}
-```
-
-三字段确保 Supervisor 首轮一定命中 routing 分支，不会被 Checkpointer 恢复的旧中间状态污染。
-
-### astream_events 只用一次
-
-LangGraph 的 `astream_events` 如果分两次调，第二次会从 Checkpointer 恢复后跳过已执行的 Worker。所以整个图只调用一次，事件通过 `event_type` 分发：
-
-| event_type | 处理 | 推 SSE 事件 |
-|------------|------|------------|
-| `on_chat_model_stream` | 取 `chunk.content` → `_clean_markdown()` | `event: token` |
-| `on_chain_end` + `reasoning` | 取 `output["reasoning"]` | `event: reasoning` |
-| `on_chain_end` + `worker_results` | 遍历 Worker → `WORKER_CARD_MAP` 映射 → `emitted_workers` 去重 | `event: structure_ready` |
-| `on_chain_end` + `final_answer` | 取 `output["final_answer"]` → `_clean_markdown()` | 暂存，aquire 后统一推 `end` |
-
-### 深度思考双路径兼容
-
-Supervisor 解析 `<think>` 标签时，同时检查两种 LLM 返回格式：
-1. **字符串内嵌**：`raw = "<think>思考内容</think>最终回答"` → `re.search(r"<think>(.*?)</think>", raw, re.DOTALL)` 提取
-2. **独立字段**：`response.reasoning_content`（部分模型把 reasoning 放在独立字段）
-
-### 降级策略汇总
-
-| 环节 | 降级 |
-|------|------|
-| 意图分类 JSON 解析失败 | 默认 `["qa_worker"]` |
-| MySQL 查询失败（Plan/Advice） | 降级为"无规则/无通勤/无模板" |
-| `itinerary_templates` 表不存在 | try/except 捕获 `ProgrammingError` / `OperationalError` → "（无行程模板）" |
-| RAG 检索为空 | 回退 LLM 软知识回答，强制数字序号列表 |
-| Supervisor 汇总 LLM 失败 | 直接拼接 Worker 原始结果作为 final_answer |
-| 识图模型调用失败 | 返回 `"抱歉，图片识别失败：{e}"` |
-| 天气 API Key 未配置 | 返回 `"天气查询暂不可用（未配置高德 API Key）"` |
-| DuckDuckGo 联网搜索失败 | 返回空字符串 → Supervisor 不追加搜索结果 → 纯 RAG 回答 |
 
 ---
 
