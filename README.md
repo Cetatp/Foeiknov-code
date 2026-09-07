@@ -808,6 +808,131 @@ chengdu-travel-agent/
 
 ---
 
+## 🧹 Supervisor 完整实现细节
+
+### 问候语识别（不走 Worker）
+
+`nodes.py` 硬编码了 30 个问候/闲聊关键词，短消息（≤10 字符）命中直接返回固定回答，不消耗 LLM Token：
+
+```python
+GREETING_PATTERNS = [
+    "你好", "您好", "hi", "hello", "hey", "在吗", "在不在",
+    "你是谁", "你叫什么", "介绍一下你自己", "你能做什么", "你会什么",
+    "谢谢", "感谢", "thanks", "thank you",
+    "再见", "拜拜", "bye",
+    "早上好", "下午好", "晚上好",
+]
+```
+
+自我介绍返回 4 项能力清单（📖 查询景点 / 📋 行程规划 / 📍 周边推荐 / 💡 六维建议），告别返回"祝你在成都玩得开心 🎉"。
+
+### 天气查询旁路（不派发 Worker）
+
+23 个天气关键词（`WEATHER_KEYWORDS`）命中 → `get_weather("成都", "all")` 调高德 API 拿到 3 天预报 → LLM 润色成友好回答。降级：API Key 未配置 → "天气查询暂不可用（未配置高德 API Key）"；LLM 失败 → 直接返回原始天气数据字符串。
+
+**高德天气 API 细节**：
+- `CHENGDU_ADCODE = "510100"`（成都城市编码）
+- `httpx.get(timeout=10)` 带 10 秒超时
+- `extensions="base"` 实况天气（单天）vs `extensions="all"` 预报（3 天）
+- `WEATHER_MAP` 兜底映射：sunny→晴 / cloudy→多云 / overcast→阴 / rain→雨 / snow→雪 / fog→雾 / haze→霾
+
+### 意图分类后的合法性校验
+
+Supervisor 意图分类输出 JSON 后，做两步清洗：
+1. `dict.fromkeys()` 去重（防止 LLM 重复输出同一个 Worker）
+2. `[w for w in workers if w in VALID_WORKERS]` 合法性校验（`VALID_WORKERS = {"qa_worker", "plan_worker", "advice_worker", "nearby_worker"}`）
+3. 最终兜底：清洗后为空 → 默认 `["qa_worker"]`
+
+### 识图模式（跳过 Worker 直接汇总）
+
+两个触发点：
+- **首轮 routing**：`state["image"]` 有值 → `phase` 直接设为 `"summary"`，`next_workers=[]`，跳过 Worker 派发
+- **次轮 summary**：`image` 有值 → 调 `get_llm("vision")` 用 vision 模型做多模态分析，HumanMessage content 为 `[{"type": "text"}, {"type": "image_url", "image_url": {"url": image}}]`
+
+### _clean_markdown 清洗逻辑
+
+`nodes.py` 和 `chat_routes.py` 各有一份相同的 `_clean_markdown()`，保留结构、删除前端不渲染的标记：
+
+| 保留 | 删除 |
+|------|------|
+| `## 标题` / `- 列表` / `1. 列表` | `**加粗**` |
+| `\| 表格分隔符` / `> 引用` | 行内 `*`（非列表前缀） |
+| emoji / `○ 子项` / 空行 | `` `代码` `` |
+| | `--- / *** / ___` 分隔线行 |
+
+额外处理：`\n{3,}` 压缩为 `\n\n`，`strip()` 去首尾空白。
+
+---
+
+## 🔐 SSE 流式事件完整实现
+
+### thread_id 唯一策略
+
+每次请求生成 `thread_id = {session_id}_{timestamp_ms}_{uuid4_hex_8}`，例如 `default_1744032000000_a3f9b2c1`。**跨请求永不复用同一个 thread_id**，避免 Checkpointer 恢复上一次的 `phase="summary"` / `worker_results` 导致 Supervisor 跳过 Worker 直接汇总旧结果。
+
+### initial_state 重置
+
+```python
+initial_state = {
+    "phase": "routing",       # 无 reducer，直接覆盖 checkpoint 旧值
+    "final_answer": "",        # 无 reducer，直接覆盖
+    "worker_results": {},      # merge_results reducer 遇空字典清空
+}
+```
+
+三字段确保 Supervisor 首轮一定命中 routing 分支，不会被 Checkpointer 恢复的旧中间状态污染。
+
+### astream_events 只用一次
+
+LangGraph 的 `astream_events` 如果分两次调，第二次会从 Checkpointer 恢复后跳过已执行的 Worker。所以整个图只调用一次，事件通过 `event_type` 分发：
+
+| event_type | 处理 | 推 SSE 事件 |
+|------------|------|------------|
+| `on_chat_model_stream` | 取 `chunk.content` → `_clean_markdown()` | `event: token` |
+| `on_chain_end` + `reasoning` | 取 `output["reasoning"]` | `event: reasoning` |
+| `on_chain_end` + `worker_results` | 遍历 Worker → `WORKER_CARD_MAP` 映射 → `emitted_workers` 去重 | `event: structure_ready` |
+| `on_chain_end` + `final_answer` | 取 `output["final_answer"]` → `_clean_markdown()` | 暂存，aquire 后统一推 `end` |
+
+### 深度思考双路径兼容
+
+Supervisor 解析 `<think>` 标签时，同时检查两种 LLM 返回格式：
+1. **字符串内嵌**：`raw = "<think>思考内容</think>最终回答"` → `re.search(r"<think>(.*?)</think>", raw, re.DOTALL)` 提取
+2. **独立字段**：`response.reasoning_content`（部分模型把 reasoning 放在独立字段）
+
+### 降级策略汇总
+
+| 环节 | 降级 |
+|------|------|
+| 意图分类 JSON 解析失败 | 默认 `["qa_worker"]` |
+| MySQL 查询失败（Plan/Advice） | 降级为"无规则/无通勤/无模板" |
+| `itinerary_templates` 表不存在 | try/except 捕获 `ProgrammingError` / `OperationalError` → "（无行程模板）" |
+| RAG 检索为空 | 回退 LLM 软知识回答，强制数字序号列表 |
+| Supervisor 汇总 LLM 失败 | 直接拼接 Worker 原始结果作为 final_answer |
+| 识图模型调用失败 | 返回 `"抱歉，图片识别失败：{e}"` |
+| 天气 API Key 未配置 | 返回 `"天气查询暂不可用（未配置高德 API Key）"` |
+| DuckDuckGo 联网搜索失败 | 返回空字符串 → Supervisor 不追加搜索结果 → 纯 RAG 回答 |
+
+---
+
+## 📈 数据种子精确数量
+
+从 `backend/data/` 目录实际 CSV 文件验证：
+
+| 文件 | 行数 | 说明 |
+|------|------|------|
+| `spots_seed.csv` | **1,554** | 景点主表 |
+| `foods_seed.csv` | **80** | 美食种类 |
+| `food_shops_seed.csv` | **1,624** | 美食店铺 |
+| `avoid_rules_seed.csv` | **250** | 避坑规则 |
+| `hard_rules_seed.csv` | **53** | 硬规则（R-001~R-053） |
+| `transit_matrix.csv` | **190,157** | 通勤矩阵 |
+| `itinerary_templates.csv` | **20** | 行程模板（⚠️ CSV 存在但 MySQL 表未创建，Plan Worker try/except 降级） |
+| `query_variants.csv` | **12,605** | RAG Query Variants |
+
+**注意**：`itinerary_templates.csv` 在 `data/augmented/` 目录下有种子文件，但 `01_init_db_create_tables.py` 没建对应 MySQL 表，Plan Worker 查询时会抛 `ProgrammingError` 被 try/except 捕获。这是一个已知的"种子有但表没建"的 gap。
+
+---
+
 ## 🚀 快速启动
 
 ### 1. 后端
@@ -851,7 +976,7 @@ npm run dev  # http://localhost:5173
 | **前端** | Semi UI + Vite | 组件未抽离 Hook、无状态管理库（Zustand/Redux），对话历史用 localStorage |
 | **测试覆盖** | 3 个 pytest 文件 | 只有 Agent / RAG / Worker 基本路径，缺少 API 集成测试 + 前端 E2E |
 | **部署** | 本地运行 | 无 Dockerfile、无 CI/CD、无 HTTPS 证书 |
-| **LTM** | 已实现向量去重 | 用户画像维度单一，未做多模态偏好（文本+交互行为） |
+| **LTM** | schema-only（ORM + config 已就绪，无业务代码读写） | 用户画像硬槽位 + Milvus 向量记忆待实现 |
 
 ### 🗺️ 后续计划
 
