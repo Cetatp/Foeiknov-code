@@ -114,7 +114,7 @@ graph TD
 | 技术 | 版本 | 用途 |
 |------|------|------|
 | MySQL | 8.0 | 景点 / 美食 / 通勤矩阵持久化 |
-| Redis | 5 | 缓存加速层 |
+| Redis | 5 | Checkpointer 备选后端（当前未启用，默认 SqliteSaver） |
 | SqliteSaver | — | LangGraph 跨重启 Checkpointer |
 | Loguru | 0.7 | 结构化日志 |
 
