@@ -15,7 +15,7 @@
 
 ## 🧭 项目定位
 
-**不是 Demo Toy，是一个可以跑起来的 AI Agent 工程化样本**——从种子数据采集、RAG 向量化、多智能体编排、SSE 流式输出到前端 Markdown 渲染，形成完整闭环。
+**一个可以跑起来的 Agent 工程化样本**——不是 Demo Toy，也不是纯论文复现。从种子数据采集、RAG 向量化、多智能体编排、SSE 流式输出到前端 Markdown 渲染，形成完整闭环。核心特色是：**把 LLM 的强项（语言理解、知识扩展、规划推理）和工程的确定性（数据校验、规则硬编码、程序级兜底）结合起来**。
 
 ### 🎯 解决什么问题
 
@@ -25,6 +25,55 @@
 - **软知识按需展开**：历史文化、游玩攻略、拍照机位等 LLM 强项，按问题关键词动态激活 7 个维度组，结合预训练知识丰富回答
 - **行程不踩坑**：8 条 Python 硬编码规则 + 53 条 Prompt 规则 + validate_plan 程序级校验，三重保障生成的行程符合真实地理约束
 - **多意图并行**：用户问"熊猫基地怎么去 + 附近有什么吃的"，Supervisor 同时派发 QA + Nearby + Advice 三个 Worker，并行执行后汇总
+
+### 🤖 Agent 架构特色
+
+#### Supervisor-Worker 模式：不是单 Agent 硬扛，是分工协作
+
+传统 RAG Agent 是"一个 LLM + 一个检索器"，所有问题走同一条链路。蓉游智体用 LangGraph 的 StateGraph 把问题拆成 4 种专长 Worker：
+
+```
+用户问题 → Supervisor（意图分类）
+              │
+              ├─ qa_worker     → LlamaIndex + Milvus 双轨制 RAG
+              ├─ plan_worker   → SQL 查硬规则/通勤矩阵 + LLM 生成 + validate_plan 程序校验
+              ├─ advice_worker → MySQL 查避坑规则 + LLM 六维组织
+              └─ nearby_worker → LLM 识别景点名 + MySQL 查坐标 + Haversine 球面距离
+```
+
+关键设计决策：
+- **Send API 并行**：4 个 Worker 同时启动，共享 State，结果通过自定义 reducer 自动合并，总耗时 ≈ 最慢那个 Worker
+- **两轮职责复用同一节点**：Supervisor 通过 `state["phase"]` 和 `worker_results` 是否为空自动切换 routing/summary，省一个节点
+- **Intent fallback 链路**：JSON 解析失败 → 默认 qa_worker；RAG 检索为空 → 回退 LLM 软知识（强制数字序号列表）；Supervisor 汇总 LLM 失败 → 直接拼接 Worker 原始结果
+- **Checkpointer 隔离**：每次请求生成唯一 `thread_id = session_id + timestamp + uuid8`，跨请求永不串状态，但同一请求内 Checkpointer 保证 State 不丢
+
+#### 双轨制 Prompt：硬事实锁死，软知识放开
+
+| 轨道 | 内容 | 来源 | LLM 自由度 |
+|------|------|------|-----------|
+| 🔒 硬事实 | 票价 / 开放时间 / 通勤 / 评分 / 地址 | RAG 检索内容 | 零——必须原样使用，没有就说"暂无相关信息" |
+| 📖 软知识 | 历史 / 攻略 / 天气 / 人群 / 交通 / 周边 / 装备 | LLM 预训练知识 + 7 维关键词触发 | 高——按问题类型动态拼接维度组，允许自由扩展 |
+
+实现方式：`DynamicTextQAPrompt` 继承 LlamaIndex `PromptTemplate`，重写 `format()` 方法，在运行时调 `build_qa_prompt(query, context)` 动态拼接 `QA_BASE_PROMPT` + `G1~G7` 中命中的维度组。不是固定模板 → 是运行时根据 query 关键词决定哪些维度组激活。
+
+#### 三层防幻觉：Prompt + 代码 + 校验
+
+| 层级 | 机制 | 特点 |
+|------|------|------|
+| **数据层** | 12,605 条 Query Variants 覆盖三大长文本 | 扩大召回面，减少"检索不到"导致的幻觉 |
+| **检索层** | 向量 + BM25 → 融合 → Reranker → KeywordBoost 后处理 | 5 级流水线，`source_name` 重叠加权 + `travel_tips` 硬事实块额外 ×1.3 |
+| **Prompt 层** | `QA_BASE_PROMPT` 硬事实规则 + `SOFT_KNOWLEDGE_GROUPS` 软知识分组 | 明确告知 LLM 哪些可以编、哪些不能编 |
+| **代码层** | `validate_plan()` 8 条 Python 硬编码规则 | R-001 强制覆盖熊猫基地（最后执行，保留原安排）；R-002~R-008 检测型只记录 |
+| **降级层** | 8 项 fallback（意图分类 / MySQL / RAG / 汇总 / 识图 / 天气 / 联网 / JSON） | 任何环节出问题都不返回 500，要么降级要么返回兜底内容 |
+
+#### 其他 Agent 工程细节
+
+| 细节 | 实现 |
+|------|------|
+| **多模型切换** | 6 个预创建 ChatOpenAI 实例（fast / pro / reasoner / vision / json / worker），`get_llm(mode, deep_think)` 工厂选择；`llm_json` 和 `llm_worker` 必须 non-streaming，否则 JSON 输出/卡片内容会泄漏到聊天流式响应 |
+| **SSE 流式** | `astream_events` 只用一次 + `event_type` 分发；4 种事件（token / reasoning / structure_ready / end）；Worker 卡片先行推送，最终汇总后推 end |
+| **DeepSeek 兼容** | Monkey-Patch 三部曲：模型注册表注入 4 种 DeepSeek 模型 → tiktoken 映射到 cl100k_base → API 端点覆盖为 `chat.completions.create()` |
+| **Checkpointer 工厂** | `CHECKPOINT_BACKEND` 环境变量一行切换 sqlite / postgres / redis / memory；默认 SqliteSaver（WAL + 30s timeout） |
 
 ### 📊 数据规模
 
@@ -42,12 +91,14 @@
 
 | 维度 | 传统 RAG | 蓉游智体 |
 |------|---------|---------|
+| **Agent 架构** | 单 LLM + 单检索器 | LangGraph Supervisor + 4 专长 Worker，Send API 并行派发 |
 | 检索链路 | 向量 Top-K | 向量 Top10 + BM25 Top10 → 融合 → Reranker Top3 → KeywordBoost 后处理 |
 | Prompt | 固定模板 | 双轨制（硬事实锁死 + 7 维软知识按需拼接） |
 | 行程生成 | 单次 LLM 调用 | SQL 查硬规则 + 通勤矩阵 → LLM 生成 → validate_plan 程序级校验 |
 | 多意图 | 串行处理 | LangGraph Send API 并行派发多个 Worker |
 | 输出 | 纯文本 | SSE Token 流式 + Worker 结构化卡片先行 + 最终 Markdown 汇总 |
 | 幻觉防护 | "not prior knowledge" 提示 | 硬事实强制来自检索 + 8 条 Python 规则 + 53 条 Prompt 规则 |
+| **工程兜底** | 无 fallback | 8 项降级策略，任何环节出问题都不返回 500 |
 
 ---
 
