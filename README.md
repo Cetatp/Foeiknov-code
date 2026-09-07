@@ -284,100 +284,117 @@ POST /chat → Supervisor 意图分类
 
 ## ✨ 核心特性
 
-### 🎯 1. Supervisor 多意图并行路由
+> 下面每一条都不是"用了 LangGraph/RAG"这种套话，而是**在 LangGraph/RAG 基础上做了什么不一样的事**。
 
-用户的模糊查询（如"熊猫基地怎么去 + 附近有什么吃的"）被 Supervisor 分类后，通过 LangGraph `Send` API **并行派发**到多个 Worker，结果自动汇总：
+### 🎯 1. Supervisor 两轮复用 + Send API 并行——比多 Agent 框架更轻
 
-```mermaid
-graph LR
-    U("熊猫基地<br/>怎么去+附近吃的") --> S("Supervisor<br/>意图分类")
-    S -->|Send 并行| Q("QA Worker<br/>怎么去") & N("Nearby Worker<br/>附近景点") & A("Advice Worker<br/>附近美食")
-    Q & N & A --> R("Supervisor<br/>汇总输出")
+**别人的多 Agent**：每个 Worker 是独立节点 + 单独路由，N 个 Worker 需要 2N 个节点。
+
+**蓉游智体**：Supervisor 通过 `state["phase"]` 字段**两轮复用同一个节点**——首轮 `phase=routing` 做意图分类，次轮 `phase=summary` 做结果汇总。Worker 执行期间 Supervisor 处于"等待 Send 回调"状态，不消耗 LLM Token。
+
+```python
+# nodes.py — 同一个 supervisor 函数，两轮职责靠 phase 区分
+if state["phase"] == "routing":
+    workers = classify_intent(state["messages"])
+    return Send([build_worker_call(w, state) for w in workers])
+else:  # phase == "summary"
+    return summarize(state["worker_results"])
 ```
 
-- Supervisor 用 LLM 做意图分类，输出 JSON `{"next_workers": ["qa_worker", "nearby_worker", ...]}`
-- 4 个 Worker 并行执行，`worker_results` 字段用自定义 reducer 自动合并
-- Worker 完成后自动 join 回 Supervisor，由 `SUPERVISOR_SUMMARY_PROMPT` 做最终整合
+关键设计：
+- `Send([...])` 而不是 `Command(goto=worker)`——LangGraph 原生命令，Worker 并行执行、各自独立重试、结果通过自定义 reducer 自动合并回 `worker_results`
+- Intent 分类走 LLM 但有三重兜底：JSON 解析失败 → 默认 `["qa_worker"]`；Worker 名不在 `VALID_WORKERS` 集合 → 过滤；过滤后为空 → 默认 `["qa_worker"]`
+- 3 条旁路不派发 Worker：短消息（≤10 字符）命中 30 个问候关键词 → 固定回答；23 个天气关键词 → `get_weather()`；识图模式 → vision 模型直接分析
 
-### 🔍 2. RAG 双轨制 Prompt + 混合检索
+### 🔍 2. RAG 双轨制——硬事实锁死 vs 软知识放开，不是一刀切的"not prior knowledge"
 
-**检索链路**：用户 Query → 向量 Top10 + BM25 Top10 → QueryFusionRetriever 融合 → BGE Reranker 重排 Top3 → 动态 Prompt → LLM 生成
+**别人的 RAG**：检索到什么就喂 LLM，检索不到就让 LLM 说"我不知道"。
+
+**蓉游智体**：把问题拆成两个轨道，给 LLM 明确的权限边界。
+
+| 轨道 | 规则 | Prompt 中的措辞 |
+|------|------|----------------|
+| 🔒 硬事实 | 必须来自检索内容，没有就说"暂无" | `检索中未找到票价信息，请勿编造` |
+| 📖 软知识 | 按关键词动态激活 G1~G7 维度组，LLM 自由扩展 | `你可以结合历史背景发挥，但标注为推测` |
+
+实现核心是 `DynamicTextQAPrompt`——继承 LlamaIndex `PromptTemplate`，**重写 `format()` 方法**，在运行时调 `build_qa_prompt(query, context)` 根据 `detect_groups()` 匹配到的关键词动态拼接 `QA_BASE_PROMPT` + 命中的维度组。不是模板里写死 7 组，而是运行时决定拼哪几组。
+
+检索链路 5 级流水线（比标准 RAG 多 2 级）：
 
 ```
-Query → VectorIndexRetriever (BGE 1024维 Top10)
-      → BM25Retriever (单字 token_pattern 中文 Top10)
-      → QueryFusionRetriever (simple 融合 Top20)
-      → SentenceTransformerRerank (bge-reranker-large Top3)
-      → KeywordBoostPostprocessor (source_name 重叠加权 + travel_tips ×1.3)
-      → DynamicTextQAPrompt (双轨制 + 7维度组)
-      → DeepSeek LLM
+向量 Top10 + BM25 Top10 → QueryFusionRetriever 融合 Top20 → bge-reranker Top3 → KeywordBoost 后处理 → 双轨制 Prompt → LLM
+                                                                                         ↑
+                                                                          source_name 重叠加权 + travel_tips ×1.3
 ```
 
-**硬事实轨道**（不可编造）：
-> 门票价格、开放时间、地址、经纬度、通勤时间、评分、人均消费、景点等级 → 必须使用检索内容，检索中没有则回答"暂无相关信息"
+### 🛡️ 3. validate_plan 8 条 Python 硬编码——Prompt 管不住的用代码管
 
-**软知识轨道**（按关键词激活 G1~G7）：
-| 组 | 维度 | 触发关键词示例 |
-|---|------|---------------|
-| G1 | 文化介绍 | 介绍、历史、文化、典故、故事、特产 |
-| G2 | 游览攻略 | 怎么玩、攻略、逛、拍照、出片、机位 |
-| G3 | 季节天气 | 几月、季节、天气、雨天、什么时候去 |
-| G4 | 人群特殊 | 老人、小孩、亲子、情侣、轮椅、宠物 |
-| G5 | 交通出行 | 怎么去、交通、地铁、预约、门票怎么买 |
-| G6 | 周边串联 | 附近、周边、怎么串、一日游、吃什么 |
-| G7 | 装备准备 | 带什么、穿什么、注意事项、安全、装备 |
+**别人的行程生成**：靠 Prompt 里写"请合理安排"，但 LLM 还是可能把都江堰和青城山拆到两天、或者给 ≤3 天行程塞 Leshan 大佛。
 
-- `build_qa_prompt(query, context)` 根据 `detect_groups()` 匹配关键词，动态拼接 `QA_BASE_PROMPT` + 相关维度组
-- `DynamicTextQAPrompt` 继承 LlamaIndex `PromptTemplate`，重写 `format()` 实现运行时动态 Prompt
+**蓉游智体**：`validate_plan()` 是纯 Python 函数，在 Plan Worker 输出后**程序级校验 + 自动修正**，不依赖 LLM 自觉。
 
-### 🛡️ 3. 三层硬规则保障
+| 规则 | 类型 | 执行时机 | 修正方式 |
+|------|------|---------|---------|
+| R-001 熊猫基地 Day1 08:00-12:00 | 强制覆盖 | 最后执行 | 把原安排移到下午，熊猫基地插上午 |
+| R-002 都江堰+青城山不同市区混排 | 检测型 | 先执行 | 记录到 `plan["rules_applied"]` |
+| R-003 武侯祠+锦里同半天 | 检测型 | 先执行 | 同上 |
+| R-004 杜甫草堂+金沙同半天 | 检测型 | 先执行 | 同上 |
+| R-005 周一排除金沙/川博 | 检测型 | 先执行 | 同上 |
+| R-006 每日 ≤3 景点 | 检测型 | 先执行 | 同上 |
+| R-007 每日通勤 ≤180 分钟 | 检测型 | 先执行 | 同上 |
+| R-008 亲子/老人排除西岭雪山 | 检测型 | 先执行 | 同上 |
 
-| 层级 | 机制 | 示例 |
-|------|------|------|
-| **程序级** | `validate_plan()` Python 硬编码 8 条规则 | R-001: 熊猫基地强制 Day1 上午 08:00-12:00，原安排自动移至下午 |
-| **Prompt 级** | MySQL hard_rules 53 条注入 `PLAN_PROMPT` 的 `{hard_rules}` 占位 | 武侯祠+锦里必须同半天、都江堰+青城山必须同一天 |
-| **校验级** | Plan Worker 生成后自动调 `validate_plan()` 修正 | 违规记录到 `plan["rules_applied"]` 供调试 |
+为什么 R-001 最后执行？因为它是**强制覆盖型**，会主动修改 plan 结构；其他 7 条是**检测型**，只记录不修改。先跑完检测，再强制覆盖，最后输出的 plan 同时满足两类规则。
 
-**程序级 8 条规则**（见 [utils.py](backend/app/agents/utils.py)）：
-- R-001 熊猫基地 → Day1 上午（强制覆盖，原安排保留到下午）
-- R-002 都江堰+青城山不与市区混排
-- R-003 武侯祠+锦里同半天
-- R-004 杜甫草堂+金沙同半天
-- R-005 周一排除金沙/川博
-- R-006 每日 ≤3 景点
-- R-007 每日通勤 ≤180 分钟
-- R-008 亲子/老人团排除西岭雪山
+### 🚇 4. 19 万条通勤矩阵——让 LLM 的行程时间有据可查
 
-### 🚇 4. 通勤矩阵 + Haversine 周边
+**别人的行程规划**：LLM 自己编通勤时间（"熊猫基地到春熙路约 40 分钟" → 实际可能 1 小时）。
 
-- **190,158 条**景点对的双向通勤时间/距离，覆盖全部 1554 个景点
-- 由高德地图 distance 批量 API 计算（100 点/请求，两阶段：区域内全精确 + 跨区域 Top100 热门）
-- Nearby Worker 用 **Haversine 公式**（地球半径 6371km）计算球面距离，按半径过滤周边景点（市区 3km / 默认 5km / 郊区 10km）
-- 行程规划时 `transit_matrix` 作为 `PLAN_PROMPT` 的 `{transit_matrix}` 占位注入，确保 LLM 生成的通勤时间真实可查
+**蓉游智体**：Plan Worker 生成行程前，SQL 查 `transit_matrix` 表（`LIMIT 20`，按 same_region 优先），结果作为 `{transit_matrix}` 占位注入 `PLAN_PROMPT`。LLM 看到的是**真实的通勤时间/距离对**，而不是让它自己编。
 
-### 🧠 5. 用户画像记忆（LTM · 架构预留）
+数据来源：高德地图 `distance` 批量 API（100 点/请求），两阶段计算：
+1. 区域内（same_region=1）全精确计算
+2. 跨区域 Top100 热门景点精确计算，覆盖 100% 景点对
 
-> ⚠️ 以下功能**已完成 schema + config 预留，但业务代码尚未实现**。当前 LTM 表为空，记忆功能是架构设计的一部分，计划在后续迭代中补齐。
+Nearby Worker 还用 Haversine 球面距离（地球半径 6371km）做周边推荐——MySQL 存的是经纬度，Haversine 算直线距离，半径策略：市区 3km / 默认 5km / 郊区 10km。
 
-**MySQL 硬槽位** `user_profiles` 表（9 个字段）：
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `group_type` | Enum | solo / couple / family / friends / business / senior |
-| `budget_level` | Enum | budget / standard / comfort / luxury |
-| `pace` | Enum | relaxed / moderate / packed |
-| `allergies_json` | JSON | 忌口/黑名单 |
-| `must_include_json` | JSON | 必去景点 |
-| `must_exclude_json` | JSON | 黑名单景点 |
-| `notes` | Text | 自由备注 |
-| `ltm_chunk_count` | Integer | 累计 LTM 提取次数（防频繁覆盖） |
-| `ltm_last_extract_at` | DateTime | 最近一次提取时间 |
+### 🧩 5. 六模型工厂 + DeepSeek Monkey-Patch——让 LangChain 兼容国产 LLM
 
-**Milvus 向量记忆** `user_ltm_v1` 集合（已在 config 预留 `MILVUS_COLLECTION_LTM`）：
-- 用户偏好（如"喜欢小众景点"）以向量形式存储
-- 跨会话持久化，语义去重阈值 0.92
-- 配套 `dlq` 死信队列（archive / ltm_extract / notify 三阶段）
+**问题**：DeepSeek Chat API 虽然兼容 OpenAI，但 LangChain 的 `ChatOpenAI` 内部有三处硬编码假设：模型注册表、tiktoken 映射、API 端点路径，直接用会报 `Model xxx not found`。
 
-**当前状态**：ORM 模型 + 配置字段已就绪，但 `finalize_prompt` 注入、LTM 提取写入、dlq 异步重试等业务逻辑待实现。
+**解法**：`llm_client.py` 里三步 Monkey-Patch：
+
+```python
+# 1. 模型注册表注入 4 种 DeepSeek 模型
+ModelRegistry.register_model("deepseek-chat", ...)
+ModelRegistry.register_model("deepseek-v4-pro", ...)
+ModelRegistry.register_model("deepseek-reasoner", ...)
+ModelRegistry.register_model("deepseek-v4-flash-vision", ...)
+
+# 2. tiktoken 映射到 cl100k_base（DeepSeek 用的 tokenizer）
+MODEL_TO_ENCODING = {"deepseek-chat": "cl100k_base", ...}
+
+# 3. API 端点覆盖为 chat.completions.create()
+original_create = ChatCompletion.create
+def patched_create(*args, **kwargs): ...
+```
+
+同时预创建 6 个实例（fast / pro / reasoner / vision / json / worker），`get_llm(mode, deep_think)` 工厂选择。`llm_json` 和 `llm_worker` **必须 non-streaming**——否则 JSON 输出/卡片内容会泄漏到聊天的流式响应里。
+
+### 💨 6. SSE 流式 + 4 种事件类型——Worker 卡片先行，最终汇总后推 end
+
+**别人的 SSE**：只有 `token` 一种事件，用户看到的是纯文本逐字输出。
+
+**蓉游智体**：4 种事件 + Worker 卡片先行：
+
+```
+event: token           → LLM 流式 token，实时渲染
+event: reasoning       → 深度思考内容（<think> 标签或 reasoning_content 字段）
+event: structure_ready → Worker 完成，推结构化卡片（QA 问答卡 / Plan 行程卡 / Advice 建议卡）
+event: end             → Supervisor 汇总完成，推最终 Markdown
+```
+
+实现关键：`astream_events` **只用一次**——LangGraph 的 astream 如果分两次调，第二次会从 Checkpointer 恢复后跳过已执行的 Worker。所以整个图只调一次，事件通过 `event_type` 分发。`worker_results` 完成后立即推 `structure_ready`，用户在 LLM 还在汇总时就已经能看到各个 Worker 的输出卡片。
 
 ---
 
