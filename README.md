@@ -9,19 +9,45 @@
 ![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-> 一个基于 **多智能体 + RAG** 的成都旅游问答与行程规划助手，LangGraph 驱动 Supervisor 并行调度 4 个 Worker，LlamaIndex + Milvus 提供双轨制检索增强，53 条硬规则保障行程合理性。
+> 蓉游智体是一个面向真实用户场景的成都旅游 AI Agent：LangGraph 驱动 Supervisor 并行调度 4 个 Worker，LlamaIndex + Milvus 提供双轨制检索增强（硬事实锁死 + 软知识按需展开），8 条程序级硬规则 + 53 条 Prompt 硬规则保障行程合理性，SSE 流式输出实时渲染 Markdown 卡片。
 
 ---
 
 ## 🧭 项目定位
 
-这是一个**面向真实用户场景**的 AI Agent 实战项目，不是 Demo Toy：
+**不是 Demo Toy，是一个可以跑起来的 AI Agent 工程化样本**——从种子数据采集、RAG 向量化、多智能体编排、SSE 流式输出到前端 Markdown 渲染，形成完整闭环。
 
-- 🏛️ **覆盖 1554 个成都景点**、80+ 美食、250+ 避坑规则，全量种子数据入库
-- 🚇 **19 万条景点间通勤矩阵**（高德地图 API 批量计算），行程规划精确到分钟
-- 🛡️ **三层防幻觉**：硬事实强制来自检索内容 + 53 条硬规则 + validate_plan 程序级校验
-- 🔄 **多意图并行**：用户问"熊猫基地怎么去 + 附近有什么吃的"，Supervisor 同时派发 QA + Nearby + Advice 三个 Worker
-- 💬 **流式 SSE 输出** + 引用标注，前端直接渲染 Markdown
+### 🎯 解决什么问题
+
+传统旅游问答只有两种体验：要么 LLM 编造票价（"武侯祠门票 60 元" → 实际 50 元），要么只给冷冰冰的景点列表。蓉游智体要做的是：
+
+- **硬事实锁死**：票价、开放时间、通勤时间、评分等精确数字，**必须来自 RAG 检索内容**，检索中没有就说"暂无相关信息"
+- **软知识按需展开**：历史文化、游玩攻略、拍照机位等 LLM 强项，按问题关键词动态激活 7 个维度组，结合预训练知识丰富回答
+- **行程不踩坑**：8 条 Python 硬编码规则 + 53 条 Prompt 规则 + validate_plan 程序级校验，三重保障生成的行程符合真实地理约束
+- **多意图并行**：用户问"熊猫基地怎么去 + 附近有什么吃的"，Supervisor 同时派发 QA + Nearby + Advice 三个 Worker，并行执行后汇总
+
+### 📊 数据规模
+
+| 维度 | 数量 | 来源 |
+|------|------|------|
+| 成都景点 | **1,554** | 覆盖全部 22 个区县，含坐标/等级/票价/开放时间/描述/贴士/文化上下文 |
+| 美食种类 | **80** | 火锅/串串/川菜/小吃/凉菜/甜品等 8 大类 |
+| 美食店铺 | **1,624** | 含评分/人均/商圈 |
+| 避坑规则 | **250** | 景点/交通/天气/购物/排队等 10 大场景 |
+| 硬规则 | **53** | 含 R-001~R-008 程序级强制规则 |
+| 通勤矩阵 | **190,157** | 高德地图 API 批量计算，覆盖 100% 景点对的双向通勤 |
+| RAG Query Variants | **12,605** | 覆盖 description / travel_tips / cultural_context 三大长文本的多种用户问法 |
+
+### 🔑 与传统 RAG 的差异化
+
+| 维度 | 传统 RAG | 蓉游智体 |
+|------|---------|---------|
+| 检索链路 | 向量 Top-K | 向量 Top10 + BM25 Top10 → 融合 → Reranker Top3 → KeywordBoost 后处理 |
+| Prompt | 固定模板 | 双轨制（硬事实锁死 + 7 维软知识按需拼接） |
+| 行程生成 | 单次 LLM 调用 | SQL 查硬规则 + 通勤矩阵 → LLM 生成 → validate_plan 程序级校验 |
+| 多意图 | 串行处理 | LangGraph Send API 并行派发多个 Worker |
+| 输出 | 纯文本 | SSE Token 流式 + Worker 结构化卡片先行 + 最终 Markdown 汇总 |
+| 幻觉防护 | "not prior knowledge" 提示 | 硬事实强制来自检索 + 8 条 Python 规则 + 53 条 Prompt 规则 |
 
 ---
 
@@ -72,51 +98,81 @@ graph TD
 
 ## 🧰 技术栈
 
-### ⚡ 后端框架
+### ⚡ 后端框架 & 中间件
 
 | 技术 | 版本 | 用途 |
 |------|------|------|
-| FastAPI | 0.115 | ASGI Web 框架，类型安全路由 |
-| Uvicorn | 0.30 | 异步 ASGI 服务器 |
-| Pydantic | 2.9 | Settings + 数据校验 |
-| SQLAlchemy | 2.0 | ORM 与 MySQL 连接 |
+| FastAPI | 0.115 | ASGI Web 框架，类型安全路由 + lifespan 生命周期 |
+| Uvicorn | 0.30 | 异步 ASGI 服务器，`[standard]` 依赖 httptools + uvloop |
+| Pydantic | 2.9 | 数据校验 + `BaseSettings` 配置单例 |
+| Pydantic Settings | 2.5 | `.env` 文件注入 + 环境变量覆盖 |
+| python-multipart | 0.0.9 | Vision 模式图片上传支持 |
+| httpx | 0.27 | 高德天气 API + 异步 HTTP 客户端 |
+| aiofiles | 24.1 | 异步文件操作预留 |
 
-### 🤖 AI Agent 核心
-
-| 技术 | 版本 | 用途 |
-|------|------|------|
-| LangGraph | 0.2 | StateGraph + Send API 并行调度 |
-| LangChain | 0.3 | LLM 抽象 / Runnable / 回调 |
-| LangSmith | — | 全链路 Trace 可观测性 |
-| DeepSeek | V4-Pro / Flash | LLM 推理（多模型切换） |
-
-### 📚 RAG 检索增强
+### 🤖 AI Agent 核心（LangGraph + LangChain 生态）
 
 | 技术 | 版本 | 用途 |
 |------|------|------|
-| LlamaIndex | — | QueryEngine / Retriever |
-| Milvus Lite | 3.0 | 本地向量存储（零服务端依赖） |
-| BAAI/bge-large-zh | 1.5 | 1024 维中文嵌入模型 |
-| bge-reranker-large | — | 重排提升召回精度 |
-| BM25 (rank_bm25) | — | 稀疏检索 + 向量融合 |
+| **LangGraph** | 0.2 | StateGraph + Send API 并行调度，`astream_events` 流式输出 |
+| LangChain | 0.3 | 统一 LLM 抽象 / Runnable / 消息协议 |
+| LangChain Core | 0.3 | `BaseMessage` / `SystemMessage` / `HumanMessage` 等核心类型 |
+| LangChain Community | 0.3 | 社区扩展 |
+| LangSmith | ≥0.1.120 | 全链路 Trace 可观测性 |
+| tenacity | 8.5 | LLM 调用自动重试 |
+| tiktoken | 0.8 | Token 近似计数（`MODEL_TO_ENCODING` 映射 DeepSeek → cl100k_base） |
+| **DeepSeek API** | — | Chat API 完全兼容 OpenAI，4 种模型切换：chat / v4-pro / reasoner / v4-flash-vision |
+
+### 📚 RAG 检索增强（LlamaIndex + Milvus + BGE）
+
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| LlamaIndex | — | QueryEngine / Retriever / ResponseSynthesizer |
+| Milvus Lite | ≥3.0 | 本地文件向量存储（`.db` 文件，零服务端依赖） |
+| PyMilvus | ≥2.5 | Milvus Python SDK，`MilvusVectorStore` 对接 |
+| Sentence Transformers | 3.1 | `BAAI/bge-large-zh-v1.5`（1024 维中文嵌入）+ `bge-reranker-large`（重排） |
+| rank_bm25 | 0.2 | BM25 稀疏检索，单字 `token_pattern` 适配中文 |
+| jieba | 0.4 | 中文分词（BM25 辅助） |
+
+### 💾 数据层
+
+| 技术 | 版本 | 用途 |
+|------|------|------|
+| MySQL | 8.0 | 9 张表持久化：spots / foods / food_shops / avoid_rules / hard_rules / transit_matrix / chat_sessions / user_profiles / dlq |
+| SQLAlchemy | 2.0 | ORM + `create_engine(pool_pre_ping, pool_recycle=3600, pool_size=10, max_overflow=20)` |
+| PyMySQL | 1.1 | MySQL 异步驱动 |
+| Redis | 5 | Checkpointer 备选后端（当前未启用，默认 SqliteSaver） |
+| **SqliteSaver** | ≥2.0（langgraph-checkpoint-sqlite） | LangGraph 跨重启 Checkpointer，WAL 模式 + 30s timeout |
 
 ### 🖥️ 前端
 
 | 技术 | 版本 | 用途 |
 |------|------|------|
 | React | 19 | UI 框架 |
-| Vite | 8 | 构建工具 |
-| Semi UI | 2.103 | 组件库 |
-| SSE.js | 2.8 | 流式响应 |
+| Vite | 8 | 构建工具 + SSE 代理（`X-Accel-Buffering: no`） |
+| Semi UI | 2.103 | 组件库（Card / Tag / Typography / Space） |
+| SSE.js | 2.8 | EventSourcePolyfill 实现 POST + SSE |
 
-### 💾 数据 / 工具
+### 🔧 工具 & 运维
 
 | 技术 | 版本 | 用途 |
 |------|------|------|
-| MySQL | 8.0 | 景点 / 美食 / 通勤矩阵持久化 |
-| Redis | 5 | Checkpointer 备选后端（当前未启用，默认 SqliteSaver） |
-| SqliteSaver | — | LangGraph 跨重启 Checkpointer |
-| Loguru | 0.7 | 结构化日志 |
+| python-dotenv | 1.0 | `.env` 加载（Launcher 启动时注入） |
+| Loguru | 0.7 | 结构化日志，控制台彩色 + 文件按天轮转 + 30 天保留 + `enqueue=True` 异步写入 |
+| pandas | 2.2 | CSV 种子数据加载 |
+| numpy | 1.26 | Haversine 球面距离计算 |
+| requests | 2.32 | DuckDuckGo HTML 联网搜索（非异步，降级用） |
+| tqdm | 4.66 | 向量化进度条 |
+| pytest | 8.3 | 测试框架 |
+| pytest-asyncio | 0.24 | 异步测试支持 |
+
+### 🛠️ 外部 API
+
+| 服务 | 用途 | 降级策略 |
+|------|------|---------|
+| **高德开放平台**（`restapi.amap.com/v3/weather/weatherInfo`） | 成都天气查询 + 通勤矩阵计算数据源 | `AMAP_API_KEY` 未配置 → 返回"暂不可用" |
+| **DuckDuckGo HTML**（`html.duckduckgo.com/html/`） | 联网搜索增强时效性 | 国内不稳定 → 返回空字符串 → 纯 RAG 回答 |
+| **LangSmith**（`api.smith.langchain.com`） | 全链路 Trace 可观测性 | `LANGCHAIN_TRACING_V2=false` 时关闭 |
 
 ---
 
