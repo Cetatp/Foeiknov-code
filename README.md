@@ -193,6 +193,207 @@ Query → VectorIndexRetriever (BGE 1024维 Top10)
 
 ---
 
+## 🔌 API 接口协议
+
+### `GET /health` — 全链路健康检查
+
+逐项探测 MySQL / Milvus / LLM API Key / Checkpointer / Redis，前端可据此做连接状态指示灯。
+
+```json
+{
+  "status": "ok",
+  "mysql": "ok",
+  "milvus": "ok",
+  "llm": "ok",
+  "checkpoint": "ok (sqlite)",
+  "redis": "skipped (optional)",
+  "config_loaded": true,
+  "llm_model": "deepseek-chat",
+  "rag_engine": "llamaindex",
+  "milvus_dim": 1024,
+  "checkpoint_backend": "sqlite",
+  "mysql_db": "chengdu_travel"
+}
+```
+
+### `GET /api/spots` — 景点搜索
+
+支持关键词模糊匹配（spot_name / address）、级别过滤（5A/4A/3A）、区域过滤（成华区/武侯区...）、分页（limit 默认 20，最大 200），按 rating DESC + spot_level DESC 排序。
+
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| `keyword` | query | 模糊搜索景点名或地址 |
+| `spot_level` | query | 级别过滤 |
+| `area_tag` | query | 区域过滤 |
+| `limit` | query | 每页数量，默认 20 |
+| `offset` | query | 偏移量 |
+
+### `GET /api/spots/{spot_id}` — 景点详情
+
+返回完整字段，含 `description` / `travel_tips` / `cultural_context` 三个长文本（RAG 向量化源）和 `avg_visit_hours`。
+
+### `POST /api/chat` — SSE 流式对话
+
+唯一的 Agent 入口。请求体：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `message` | string | 用户问题 |
+| `session_id` | string | 会话 ID（多会话隔离） |
+| `mode` | enum | `fast` / `expert` / `vision` |
+| `deep_think` | bool | 是否开启深度思考（reasoner 模型） |
+| `smart_search` | bool | 是否联网搜索（DuckDuckGo HTML） |
+| `image` | string | 图片 base64 dataURL（vision 模式） |
+
+---
+
+## 📡 SSE 流式事件协议
+
+`/api/chat` 返回 `text/event-stream`，4 种事件类型，前端 `sse.js` 消费：
+
+| 事件 | 触发时机 | data 示例 |
+|------|---------|-----------|
+| `token` | LLM 流式输出每个 token | `{"text": "今天"}` |
+| `reasoning` | DeepSeek reasoner 深度思考过程 | `{"text": "用户问的是...所以应该..."}` |
+| `structure_ready` | Worker 完成，结构化卡片先行推送 | `{"type": "plan_card", "payload": {...}}` |
+| `end` | Supervisor 最终汇总完成 | `{"final_answer": "...", "session_id": "..."}` |
+
+**Worker → 卡片类型映射**：
+
+| Worker | 卡片类型 | 前端组件 |
+|--------|---------|---------|
+| `qa_worker` | `qa_card` | QACard |
+| `plan_worker` | `plan_card` | PlanCard |
+| `advice_worker` | `advice_panel` | AdvicePanel |
+| `nearby_worker` | `nearby_list` | NearbyList |
+
+**关键实现细节**：
+- `stream_events` 只用 **一次**，避免 Checkpointer 恢复导致 Worker 跳过
+- 每个请求生成唯一 `thread_id = {session_id}_{timestamp}_{uuid8}`，跨请求永不串状态
+- `initial_state` 手动重置 `phase/worker_results/final_answer`，覆盖 Checkpointer 恢复的旧中间状态
+- `_clean_markdown()` 轻量清洗：保留 ## 标题、列表、表格、引用块，去除 `**加粗**`、`代码标记`、`--- 分隔线`
+- `structure_ready` 去重：`emitted_workers` 集合确保同一 Worker 只推一次卡片
+
+---
+
+## 🧠 LangGraph State Schema
+
+`MultiAgentState`（TypedDict + Annotated reducer）定义了多智能体共享状态的完整字段：
+
+| 字段 | 类型 | Reducer | 说明 |
+|------|------|---------|------|
+| `messages` | list | `add_messages` | 聊天历史（LangGraph 一等字段，随 Checkpointer 自动持久化） |
+| `next_workers` | list | — | Supervisor 意图分类结果 |
+| `worker_results` | dict | `merge_results` | 并行 Worker 输出，right 覆盖同名 key；right 为空时清空 |
+| `final_answer` | str | — | Supervisor 第二轮汇总结果 |
+| `reasoning` | str | — | 深度思考过程 |
+| `phase` | Literal | — | `routing` / `summary` 两阶段标识 |
+| `mode` | Literal | — | `fast` / `expert` / `vision` |
+| `deep_think` | bool | — | 深度思考开关 |
+| `smart_search` | bool | — | 联网搜索开关 |
+| `image` | str | — | 图片 base64 |
+| `user_id` | str | — | 用户标识 |
+| `session_id` | str | — | 会话 ID |
+| `debug_info` | dict | `merge_debug_info` | 各节点耗时、token 数，逐层 deep merge |
+
+**自定义 reducer 逻辑**：
+- `merge_results`：right 为空字典时 → 完全替换 left（routing 阶段清空旧中间状态）；正常 Worker 输出时 → 合并
+- `merge_debug_info`：递归 deep merge，不覆盖已有节点的统计
+
+---
+
+## 🔄 Checkpointer 工厂模式
+
+`get_checkpointer_async()` 按 `CHECKPOINT_BACKEND` 环境变量一行切换后端：
+
+| 后端 | 适用场景 | 特点 |
+|------|---------|------|
+| **SqliteSaver**（默认） | 本地开发 / 零服务端 | WAL 模式 + 30s timeout 避免 "database is locked" |
+| **PostgresSaver** | 生产级 | ACID + 行级锁并发 + `saver.setup()` 自动建表 |
+| **RedisSaver** | 高并发 | Redis Stack（RedisJSON + RediSearch） |
+| **MemorySaver** | 调试 | 不跨重启，进程退出即丢失 |
+
+设计要点：异步用 `@asynccontextmanager` 做资源生命周期管理（Postgres 需 `AsyncConnectionPool`，Redis 需 `aclose()`）。
+
+---
+
+## 🤯 LlamaIndex Monkey-Patch 三部曲
+
+DeepSeek API 完全兼容 OpenAI Chat API，但 LlamaIndex 硬编码了 OpenAI 模型列表且默认用 legacy `/completions` 端点。`_ensure_settings()` 做了三处 patch：
+
+| Patch | 目标 | 做法 |
+|-------|------|------|
+| **模型注册表** | `llama_index.llms.openai.utils.ALL_AVAILABLE_MODELS` | 注入 deepseek-chat / V4-Pro / reasoner / vision，context_window 设 131072 |
+| **Tokenizer 映射** | `tiktoken.model.MODEL_TO_ENCODING` | 映射到 `cl100k_base`（DeepSeek 同款） |
+| **API 端点** | `OpenAI._complete` / `_acomplete` | 覆盖为 `chat.completions.create()`（DeepSeek 不支持 legacy completions） |
+
+---
+
+## 🎨 BGE Embedding 细节
+
+BGE v1.5 官方规定：**Query 路径必须加 instruction 前缀**，否则召回率下降 10%+。
+
+| 路径 | 前缀 | L2 归一化 |
+|------|------|----------|
+| Query | `"为这个句子生成表示以用于检索相关文章："` + 用户问题 | ✅ |
+| Document | 无，直接编码 | ✅ |
+
+LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`（景点名）拼入文本头部，增强名称匹配权重。BM25 用单字 `token_pattern=r"[\u4e00-\u9fa5]|[a-zA-Z0-9]+"` 避免中文分词后查询无法对齐。
+
+---
+
+## 🖥️ 前端交互流程
+
+**会话管理**（localStorage 持久化）：
+- 会话列表：`{id, title, messages[], createdAt, updatedAt}`
+- 标题自动取首条用户消息前 20 字（图片会话取图片名）
+- Sidebar 支持新建 / 选择 / 删除，删除当前自动切到第一个
+
+**聊天模式**：
+
+| 模式 | LLM | 说明 |
+|------|-----|------|
+| Fast | deepseek-chat | 快速回答 |
+| Expert | deepseek-v4-pro | 专家级深度回答 |
+| Vision | deepseek-v4-flash-vision-exp | 图片识图 |
+
+**SSE 消费**（`sse.js` + POST）：
+- 原生 `EventSource` 只支持 GET，前端用 `sse.js` 的 `EventSourcePolyfill` 实现 POST + SSE
+- 4 个回调：`onToken`（增量渲染）/ `onReasoning`（深度思考展开）/ `onStructure`（结构化卡片先行）/ `onEnd`（最终收敛）
+- 返回取消函数，切换会话 / 关闭页面前 abort
+
+**Markdown 渲染约定**：后端 `_clean_markdown()` 清洗掉 `**加粗**`、`代码标记`、`--- 分隔线`，前端用 Semi UI 的 Typography 直接渲染剩余的标题/列表/表格/引用块。
+
+---
+
+## 📦 数据管道
+
+**三个脚本完成从 CSV 种子到 RAG 索引**：
+
+| 脚本 | 输入 | 输出 | 说明 |
+|------|------|------|------|
+| `01_init_db_create_tables.py` | — | MySQL 9 张表 | spots / foods / food_shops / avoid_rules / hard_rules / transit_matrix / chat_sessions / user_profiles / dlq |
+| `02_import_seeds.py` | `data/seeds/*.csv` | MySQL | 删除旧种子表再追加，重置自增主键；保留 chat_sessions / user_profiles / dlq 不被清空 |
+| `03_build_rag_index.py` | `data/augmented/*.csv` | Milvus `chengdu_spots` 集合 + `query_variants` 12600+ 条 query 扩展 | BGE 1.5 向量化 → Milvus Lite 本地 DB |
+
+**9 张 MySQL 表**：
+
+| 表 | 说明 | 运行时 |
+|----|------|--------|
+| `spots` | 1554 景点（坐标/等级/票价/开放时间/描述/贴士/文化） | 每次查询 |
+| `foods` | 80+ 美食 | Advice Worker |
+| `food_shops` | 美食店铺 | Advice Worker |
+| `avoid_rules` | 250+ 避坑规则 | Advice Worker |
+| `hard_rules` | 53 条硬规则 | Plan Worker Prompt |
+| `transit_matrix` | 190,158 通勤对 | Plan Worker Prompt |
+| `chat_sessions` | 冷备归档（Checkpointer 热备） | 异步归档 |
+| `user_profiles` | LTM 硬槽位（9 字段 Enum/JSON） | finalize_prompt 注入 |
+| `dlq` | 死信队列（archive / ltm_extract / notify） | 异步重试 |
+
+**联网搜索降级策略**：`web_search()` 基于 DuckDuckGo HTML 搜索，国内不稳定时失败返回空字符串，Agent 自动退化为纯本地 RAG 回答。
+
+---
+
 ## 📊 数据规模
 
 | 数据 | 数量 | 说明 |
