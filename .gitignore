@@ -92,3 +92,9 @@ backend/data/checkpoints/
 *.backup.csv
 *.bak
 *.tmp
+
+# ===== 本地文档（不入仓库）=====
+完整方案_*.md
+简历项目经历_*.md
+面试全指南_*.md
+项目锐评_*.md
