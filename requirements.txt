@@ -1,0 +1,73 @@
+# ====================================================================
+# 成都旅游智能体助手 · 完整依赖清单
+# 对应《完整方案_秋招面试版》10阶段 + 阶段11记忆升级
+# 技术栈：FastAPI + LangChain + LangGraph + SqliteSaver(跨重启Checkpointer)
+#       + RAG(Milvus Lite + BGE) + MySQL + Redis + LTM(Milvus向量+MySQL结构化) + DeepSeek
+# ====================================================================
+
+# ===== Web 框架 =====
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-multipart==0.0.9
+httpx==0.27.2
+aiofiles==24.1.0
+
+# ===== 关系数据库 =====
+sqlalchemy==2.0.35
+pymysql==1.1.1
+cryptography==43.0.1
+
+# ===== 缓存（Redis 仅加速层，记忆真源 = SqliteSaver SQLite 文件） =====
+redis==5.0.8
+
+# ===== [Agent核心] LangChain + LangGraph =====
+langgraph==0.2.39
+langchain==0.3.3
+langchain-core==0.3.10
+langchain-community==0.3.3
+langchain-deepseek==0.1.3
+langchain-mcp-adapters==0.1.8
+tenacity==8.5.0
+
+# ===== [Agent核心 · ★ 跨重启持久化 Checkpointer · 默认 SqliteSaver(SQLite3文件)] =====
+# ★ 独立包（langgraph 主包不内置）：导入路径 langgraph.checkpoint.sqlite / .aio
+# ★ 版本务必与 langgraph 0.2.x 对齐（langgraph-checkpoint 父依赖版本必须匹配），
+#   不要 pip install 最新版，否则会把 langgraph-checkpoint 拉到 0.3.x 触发契约不兼容。
+#   同步接口 SqliteSaver(sqlite3.Connection)；异步 AsyncSqliteSaver.from_conn_string()
+#   Windows 下建议开启 WAL + timeout=30s 避免 "database is locked"。
+langgraph-checkpoint-sqlite>=0.2.0,<0.3.0
+# ═════ 其他可切换 checkpointer 后端（按需安装，默认不装，避免冲突）═════
+# - RedisSaver：要求 Redis Stack(RedisJSON+RediSearch)  → langgraph-checkpoint-redis>=0.2.0,<0.3.0
+# - PostgresSaver：企业级上生产首选 JSONB+blob       → langgraph-checkpoint-postgres>=0.2.0,<0.3.0
+# MemorySaver 已内置在 langgraph 主包，无需额外安装。
+
+# ===== [Agent核心] Token 近似计数（Rolling Summary 压缩器用） =====
+tiktoken==0.8.0
+
+# ===== [Agent核心] RAG 向量检索（默认 Milvus Lite，零服务端依赖） =====
+# ★ Milvus Lite 必须 ≥ 2.4.x：从 2.4 开始支持 MilvusClient(uri=本地.db 文件) 的嵌入模式，无需启动 Milvus 服务端
+pymilvus==2.4.6
+# ★ FAISS 已不再使用（已全量切换 Milvus Lite），如面试需要可手动打开对比演示
+# faiss-cpu==1.8.0.post1
+sentence-transformers==3.1.1      # BAAI/bge-large-zh-v1.5（向量化模型：1024维）
+jieba==0.42.1
+rank_bm25==0.2.2
+
+# ===== 数据处理 =====
+pandas==2.2.2
+numpy==1.26.4
+
+# ===== 工具 =====
+python-dotenv==1.0.1
+loguru==0.7.2
+tqdm==4.66.5
+requests==2.32.3
+
+# ===== 测试 =====
+pytest==8.3.3
+pytest-asyncio==0.24.0
+
+# ===== [可选·面试加分] LangSmith 链路追踪 =====
+# langsmith==0.1.120

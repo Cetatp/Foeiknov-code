@@ -1,0 +1,61 @@
+/* ===== DeepSeek 风格设计 Tokens ===== */
+:root {
+  --ds-blue: #4d6bfe;
+  --ds-blue-hover: #3d5af0;
+  --ds-blue-light: #eef1ff;
+  --ds-sidebar-bg: #f7f7f8;
+  --ds-main-bg: #ffffff;
+  --ds-text-primary: #1a1a1a;
+  --ds-text-secondary: #6b7280;
+  --ds-text-tertiary: #9ca3af;
+  --ds-border: #e5e7eb;
+  --ds-border-light: #f0f0f1;
+  --ds-user-bubble: #f4f4f5;
+  --ds-hover: #ececef;
+  --ds-radius-sm: 8px;
+  --ds-radius-md: 12px;
+  --ds-radius-lg: 18px;
+  --ds-radius-full: 999px;
+
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ds-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--ds-main-bg);
+}
+
+/* 流式光标闪烁 */
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* 滚动条 */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* Semi UI 覆盖：去边框、扁平化 */
+.semi-button {
+  border-radius: var(--ds-radius-md) !important;
+}
+.semi-button-content {
+  font-weight: 500;
+}
