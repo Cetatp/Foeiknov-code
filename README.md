@@ -101,7 +101,8 @@ graph TD
 ## ✨ 核心特性
 
 ### 🎯 1. Supervisor 多意图并行路由
-用户的模糊查询（如"熊猫基地怎么去 + 附近有什么吃的"）被 Supervisor 分类后，通过 `Send` API **并行派发**到多个 Worker，结果自动汇总：
+
+用户的模糊查询（如"熊猫基地怎么去 + 附近有什么吃的"）被 Supervisor 分类后，通过 LangGraph `Send` API **并行派发**到多个 Worker，结果自动汇总：
 
 ```mermaid
 graph LR
@@ -110,23 +111,85 @@ graph LR
     Q & N & A --> R("Supervisor<br/>汇总输出")
 ```
 
-### 🔍 2. RAG 双轨制 Prompt
-- **硬事实轨道**：票价、时间、地址、通勤时间 → **必须来自检索内容**，禁止 LLM 编造
-- **软知识轨道**：历史、文化、体验故事 → 分 7 个维度组按需触发，允许 LLM 扩展
+- Supervisor 用 LLM 做意图分类，输出 JSON `{"next_workers": ["qa_worker", "nearby_worker", ...]}`
+- 4 个 Worker 并行执行，`worker_results` 字段用自定义 reducer 自动合并
+- Worker 完成后自动 join 回 Supervisor，由 `SUPERVISOR_SUMMARY_PROMPT` 做最终整合
+
+### 🔍 2. RAG 双轨制 Prompt + 混合检索
+
+**检索链路**：用户 Query → 向量 Top10 + BM25 Top10 → QueryFusionRetriever 融合 → BGE Reranker 重排 Top3 → 动态 Prompt → LLM 生成
+
+```
+Query → VectorIndexRetriever (BGE 1024维 Top10)
+      → BM25Retriever (单字 token_pattern 中文 Top10)
+      → QueryFusionRetriever (simple 融合 Top20)
+      → SentenceTransformerRerank (bge-reranker-large Top3)
+      → KeywordBoostPostprocessor (source_name 重叠加权 + travel_tips ×1.3)
+      → DynamicTextQAPrompt (双轨制 + 7维度组)
+      → DeepSeek LLM
+```
+
+**硬事实轨道**（不可编造）：
+> 门票价格、开放时间、地址、经纬度、通勤时间、评分、人均消费、景点等级 → 必须使用检索内容，检索中没有则回答"暂无相关信息"
+
+**软知识轨道**（按关键词激活 G1~G7）：
+| 组 | 维度 | 触发关键词示例 |
+|---|------|---------------|
+| G1 | 文化介绍 | 介绍、历史、文化、典故、故事、特产 |
+| G2 | 游览攻略 | 怎么玩、攻略、逛、拍照、出片、机位 |
+| G3 | 季节天气 | 几月、季节、天气、雨天、什么时候去 |
+| G4 | 人群特殊 | 老人、小孩、亲子、情侣、轮椅、宠物 |
+| G5 | 交通出行 | 怎么去、交通、地铁、预约、门票怎么买 |
+| G6 | 周边串联 | 附近、周边、怎么串、一日游、吃什么 |
+| G7 | 装备准备 | 带什么、穿什么、注意事项、安全、装备 |
+
+- `build_qa_prompt(query, context)` 根据 `detect_groups()` 匹配关键词，动态拼接 `QA_BASE_PROMPT` + 相关维度组
+- `DynamicTextQAPrompt` 继承 LlamaIndex `PromptTemplate`，重写 `format()` 实现运行时动态 Prompt
 
 ### 🛡️ 3. 三层硬规则保障
-1. **程序级**：8 条 Python 硬编码规则（如熊猫基地必须 Day1 7:30-12:00）
-2. **Prompt 级**：53 条规则注入 System Message
-3. **校验级**：`validate_plan()` 程序级校验 + 自动修正
 
-### 🚇 4. 通勤矩阵
-- 覆盖 1554 个景点的**双向通勤时间/距离**（19 万行）
-- 高德地图 distance 批量 API 计算（100 点/请求）
-- 行程规划精确到分钟
+| 层级 | 机制 | 示例 |
+|------|------|------|
+| **程序级** | `validate_plan()` Python 硬编码 8 条规则 | R-001: 熊猫基地强制 Day1 上午 08:00-12:00，原安排自动移至下午 |
+| **Prompt 级** | 53 条规则注入 `PLAN_PROMPT` 的 `{hard_rules}` 占位 | 武侯祠+锦里必须同半天、都江堰+青城山必须同一天、Leshan 大佛排除 ≤3 日行程 |
+| **校验级** | Plan Worker 生成后自动调 `validate_plan()` 修正 | 违规记录到 `plan["rules_applied"]` 供调试 |
+
+**程序级 8 条规则**（见 [utils.py](backend/app/agents/utils.py)）：
+- R-001 熊猫基地 → Day1 上午（强制覆盖，原安排保留到下午）
+- R-002 都江堰+青城山不与市区混排
+- R-003 武侯祠+锦里同半天
+- R-004 杜甫草堂+金沙同半天
+- R-005 周一排除金沙/川博
+- R-006 每日 ≤3 景点
+- R-007 每日通勤 ≤180 分钟
+- R-008 亲子/老人团排除西岭雪山
+
+### 🚇 4. 通勤矩阵 + Haversine 周边
+
+- **190,158 条**景点对的双向通勤时间/距离，覆盖全部 1554 个景点
+- 由高德地图 distance 批量 API 计算（100 点/请求，两阶段：区域内全精确 + 跨区域 Top100 热门）
+- Nearby Worker 用 **Haversine 公式**（地球半径 6371km）计算球面距离，按半径过滤周边景点（市区 3km / 默认 5km / 郊区 10km）
+- 行程规划时 `transit_matrix` 作为 `PLAN_PROMPT` 的 `{transit_matrix}` 占位注入，确保 LLM 生成的通勤时间真实可查
 
 ### 🧠 5. 长期用户画像记忆（LTM）
-- Milvus 向量存储用户偏好（如"喜欢小众景点"）
-- 会话间持久化，跨轮次语义去重（阈值 0.92）
+
+**MySQL 硬槽位** `user_profiles` 表（9 个字段）：
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `group_type` | Enum | solo / couple / family / friends / business / senior |
+| `budget_level` | Enum | budget / standard / comfort / luxury |
+| `pace` | Enum | relaxed / moderate / packed |
+| `allergies_json` | JSON | 忌口/黑名单 |
+| `must_include_json` | JSON | 必去景点 |
+| `must_exclude_json` | JSON | 黑名单景点 |
+| `notes` | Text | 自由备注 |
+| `ltm_chunk_count` | Integer | 累计 LTM 提取次数 |
+| `ltm_last_extract_at` | DateTime | 最近一次提取时间 |
+
+**Milvus 向量记忆** `user_ltm_v1` 集合：
+- 用户偏好（如"喜欢小众景点""拍照好看优先"）以向量形式存储
+- 跨会话持久化，语义去重阈值 0.92
+- LTM 提取失败时写入 `dlq`（DeadLetter 死信队列），支持异步重试
 
 ---
 
