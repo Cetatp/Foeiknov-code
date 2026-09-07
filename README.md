@@ -553,32 +553,139 @@ Supervisor 不是单一节点，而是**同一节点承担两轮职责**，通�
 
 ## 👷 四个 Worker 实现细节
 
-### QA Worker — RAG + 软知识回退
+每个 Worker 都是**独立的 LangGraph 节点**，通过 `Send([...])` 原生命令并行调用，结果通过 `worker_results` 自定义 reducer 自动合并。每个 Worker 内部有独立的 MySQL 降级逻辑（try/except 不阻断后续 Worker）。
 
-- 优先 `build_query_engine().aquery(user_msg)` 调用 RAG
-- 检索为空（"知识库中暂无" / "empty response"）→ **回退到 LLM 软知识回答**
-- 软知识回退时强制输出数字序号列表（禁止 #、**、`、|、--- 等符号），说明是参考信息
+### 📋 Worker 调用总览
 
-### Plan Worker — 硬规则注入 + 程序级校验
+```python
+# LangGraph Send API — 并行派发，各自独立执行
+return Send([
+    Command(goto=qa_worker, update={...}),
+    Command(goto=plan_worker, update={...}),
+    Command(goto=advice_worker, update={...}),
+    Command(goto=nearby_worker, update={...}),
+])
+```
 
-- **SQL 动态查询**：MySQL 查询 hard_rules（按 priority ASC 排序）+ transit_matrix（same_region=1 LIMIT 20）+ itinerary_templates（⚠️ 表尚未创建，代码 try/except 降级为"无行程模板"）
-- 三项数据作为 `{hard_rules}` / `{transit_matrix}` / `{templates}` 占位注入 `PLAN_PROMPT`
-- LLM 输出 JSON 后，**立即调 `validate_plan()` 做程序级校验**
-- 违规记录到 `plan["rules_applied"]`（如 `R-002(violated:day1都江堰与市区混排)`）
-- MySQL 查询失败降级为"无规则/无通勤/无模板"模式，不阻断生成
+Worker 选择逻辑由 Supervisor LLM 输出 JSON 决定，5 条判断规则（见 `SUPERVISOR_PROMPT`）：
 
-### Advice Worker — 六维建议 + 避坑规则注入
+| 用户输入 | 意图分类结果 |
+|---------|-------------|
+| "杜甫草堂门票多少钱" | `["qa_worker"]` |
+| "帮我规划 3 天行程" | `["plan_worker"]` |
+| "我想去杜甫草堂"（模糊） | `["qa_worker", "nearby_worker", "advice_worker"]` |
+| "有什么避坑建议" | `["advice_worker"]` |
+| "春熙路附近有什么" | `["nearby_worker"]` |
 
-- 从 MySQL 查 avoid_rules（250+ 条），注入 `ADVICE_PROMPT` 的 `{avoid_rules}` 占位
-- 按 6 个维度组织回答：🌤 天气季节 / 💰 预算参考 / 🚇 交通出行 / ⚠️ 避坑提醒 / 🍜 美食推荐 / 📸 拍照攻略
-- 输出禁止表格、**加粗**、代码块、--- 分隔线
+---
 
-### Nearby Worker — Haversine 球面距离 + 动态半径
+### 🔍 QA Worker — RAG 双轨制 + 软知识回退
 
-- Supervisor 先调 LLM 做 **景点名识别 + 半径决策**（输出 JSON `{"spot_name": "宽窄巷子", "radius_km": 5}`）
-- 半径策略：市区景点 3km / 默认 5km / 郊区（都江堰/青城山）10km
-- 从 MySQL 查目标景点经纬度 → Haversine 公式算球面距离 → 过滤半径内景点
-- Haversine 参数：地球半径 R = 6371.0 km
+**核心链路**：用户问题 → LlamaIndex `QueryEngine.aquery()` → 双轨制 Prompt → LLM 生成
+
+**RAG 为空的判断逻辑**（四条件 OR）：
+```python
+is_empty = (
+    not content
+    or content.lower() in ("empty response", "none", "null")
+    or "知识库中暂无" in content
+)
+```
+
+**软知识回退 Prompt 关键约束**：
+- 必须说明"以下内容来自通用知识而非景点数据库"
+- 必须用**数字序号列表**（1. xxx 2. xxx）
+- 禁止开场白/结尾语
+- 禁止 `#` / `**` / `` ` `` / `|` / `---` 等符号
+
+回退用 `llm_worker`（non-streaming），因为需要拿到完整输出再交给 Supervisor 汇总，不能让 token 泄漏到聊天流式响应。
+
+---
+
+### 📅 Plan Worker — SQL 动态注入 + validate_plan 程序级强制
+
+**三阶段流水线**：SQL 查数据 → LLM 生成 JSON → `validate_plan()` 程序校验
+
+**SQL 查询三条**（每条独立 try/except）：
+```sql
+-- 1. 硬规则（53 条，按 priority ASC 排序）
+SELECT rule_content, reason, priority FROM hard_rules ORDER BY priority ASC
+
+-- 2. 通勤约束（同区域优先，取 20 条）
+SELECT from_spot_name, to_spot_name, transit_mode, duration_min
+FROM transit_matrix WHERE same_region=1 LIMIT 20
+
+-- 3. 行程模板（⚠️ MySQL 表未创建，try/except 降级为"无行程模板"）
+SELECT template_json FROM itinerary_templates LIMIT 5
+```
+
+**PLAN_PROMPT 输出 JSON Schema**：
+```json
+{
+  "title": "行程标题",
+  "start_date": "YYYY-MM-DD",
+  "days": [{
+    "day": 1,
+    "morning": {"spot_name": "...", "time": "08:00-12:00", "desc": "..."},
+    "afternoon": {"spot_name": "...", "time": "13:00-17:00", "desc": "..."},
+    "evening": {"spot_name": "...", "time": "18:00-21:00", "desc": "..."},
+    "transit_minutes": 90,
+    "budget": 300
+  }],
+  "total_budget": 3000,
+  "group_type": "亲子/情侣/老人/学生/通用"
+}
+```
+
+**关键设计**：`validate_plan(plan)` 返回的是**修改后的 dict**（不是异常），Plan Worker 直接把 dict 塞进 `worker_results`，前端 PlanCard 需要 `JSON.parse` 渲染，所以**不做 `json.dumps`**。
+
+---
+
+### 💡 Advice Worker — MySQL 避坑规则 + 六维强制输出
+
+**SQL 查询**：只取高优先级避坑规则（severity='high'，LIMIT 15），避免 Prompt 过长。
+
+**ADVICE_PROMPT 六维强制格式**：
+```
+1. 🌤 天气与季节
+2. 💰 预算参考
+3. 🚇 交通出行
+4. ⚠️ 避坑提醒  ← 从 avoid_rules 表注入
+5. 🍜 美食推荐
+6. 📸 拍照攻略
+```
+
+格式约束：用 `##` 二级标题 + emoji 前缀，嵌套列表用 `- 顶层 + ○ 子项`，**禁止表格/加粗/代码块/分隔线**——因为前端 QACard 只支持基础 Markdown。
+
+---
+
+### 📍 Nearby Worker — Bounding Box 预过滤 + Haversine 精算
+
+**两阶段地理计算**：Bounding Box 粗筛 → Haversine 精算
+
+**为什么要 Bounding Box**：Haversine 公式对每个景点都要算一次 sin/cos，1554 个景点就是 1554 次三角函数。先用经纬度做 Bounding Box 粗筛（`1° ≈ 111km`，SQL 直接 BETWEEN），把候选集从 1554 降到几十，再用 Haversine 精算，速度提升 10-50x。
+
+```sql
+-- Bounding Box 预过滤（1°≈111km）
+SELECT spot_name, longitude, latitude, rating FROM spots
+WHERE longitude BETWEEN :lon_min AND :lon_max
+  AND latitude BETWEEN :lat_min AND :lat_max
+```
+
+**Haversine 公式**（`utils.py`）：
+```python
+def haversine(lon1, lat1, lon2, lat2):
+    R = 6371.0  # 地球半径 km
+    ...
+```
+
+**排序 + 截断**：按 `distance_km` 升序排，取 TOP 10，返回 `[{"name": "...", "distance_km": 1.2, "rating": 4.8}, ...]`——直接传 list 不做 `json.dumps`，前端 NearbyList 直接解析。
+
+**LLM 半径决策**（`NEARBY_PROMPT`）：
+```json
+{"spot_name": "宽窄巷子", "radius_km": 3}
+```
+半径策略：市区 3km / 默认 5km / 郊区（都江堰/青城山）10km。LLM 识别景点名后决定半径，不是硬编码。
 
 ---
 
