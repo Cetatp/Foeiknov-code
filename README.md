@@ -298,9 +298,14 @@ class Settings(BaseSettings):
         extra="ignore",        # .env 里多写了字段不报错（向后兼容）
         case_sensitive=True,   # 区分大小写，避免 MYSQL_HOST vs mysql_host 混淆
     )
-    DEEPSEEK_MODEL: str = "deepseek-chat"
-    MILVUS_DB_PATH: str = "127.0.0.1:19530"
-    ... # 60+ 字段
+    DEEPSEEK_MODEL: str = "deepseek-chat"       # 快速模式
+    DEEPSEEK_MODEL_PRO: str = "deepseek-v4-pro"  # 专家模式
+    MYSQL_HOST: str = "127.0.0.1"
+    MYSQL_PORT: int = 3306
+    MILVUS_DB_PATH: str = "127.0.0.1:19530"      # .db 后缀自动切 Lite
+    EMBED_MODEL_NAME: str = "BAAI/bge-large-zh-v1.5"
+    CHECKPOINT_BACKEND: str = "sqlite"           # 可选 redis/postgres/memory
+    # ... (完整 60+ 字段见下方配置表)
 ```
 
 **派生属性（@property）真实源码**——为什么不直接存字符串：
@@ -363,35 +368,89 @@ def milvus_uri(self) -> str:
 
 **蓉游智体**：Supervisor 通过 `state["phase"]` 字段**两轮复用同一个节点**——首轮 `phase=routing` 做意图分类，次轮 `phase=summary` 做结果汇总。Worker 执行期间 Supervisor 处于"等待 Send 回调"状态，不消耗 LLM Token。
 
-**Supervisor 真实源码**（`nodes.py`）——phase + worker_results 双重判断：
+**Supervisor 核心片段**（`nodes.py` L114-314）——phase + worker_results 双重判断，含完整三路旁路：
 
 ```python
 async def supervisor(state: MultiAgentState) -> dict:
     phase = state.get("phase", "routing")
     worker_results = state.get("worker_results") or {}
 
-    # 第二轮：所有 Worker 执行完毕，汇总输出
+    # ── 第二轮：Worker 执行完毕，汇总输出 ──
     if phase == "summary" or worker_results:
-        # 识图模式 → vision 模型直接分析
+        # ① 识图模式 → vision 模型直接分析（不走 Worker）
         if state.get("image"):
             vision_llm = get_llm("vision", False)
-            response = await vision_llm.ainvoke([...multimodal messages...])
-            return {"phase": "summary", "final_answer": response.content, ...}
+            response = await vision_llm.ainvoke([
+                SystemMessage(content="你是蓉游智体 PandaAgent，擅长识别景点、美食、路线图片。请用中文回答用户关于图片的问题。"),
+                HumanMessage(content=[
+                    {"type": "text", "text": user_msg or "请描述这张图片的内容"},
+                    {"type": "image_url", "image_url": {"url": image}},
+                ]),
+            ])
+            return {"phase": "summary", "final_answer": response.content,
+                    "messages": [AIMessage(content=response.content)]}
 
-        # 无 Worker 结果 → 直接问候回答（不调 LLM）
+        # ② 无 Worker 结果 → 直接问候回答（不调 LLM）
         if not worker_results:
-            return {"phase": "summary", "final_answer": _greeting_response(msg), ...}
+            return {"phase": "summary", "final_answer": _greeting_response(user_msg),
+                    "messages": [AIMessage(content=_greeting_response(user_msg))]}
 
-        # 汇总 Worker 结果 → 调 LLM 生成最终回答
-        prompt = _build_summary_prompt(worker_results)
-        response = await llm_summary.ainvoke(prompt)
-        return {"phase": "summary", "final_answer": response.content, ...}
+        # ③ 汇总 Worker 结果 → 调 LLM 生成最终回答（含 smart_search 联网搜索）
+        summary = "\n\n".join(f"【{n}】\n{c}" for n, c in worker_results.items())
+        if state.get("smart_search"):
+            summary += f"\n\n【联网搜索结果】\n{web_search(user_msg)}"
+        summary_llm = get_llm(state.get("mode", "fast"), state.get("deep_think", False))
+        response = await summary_llm.ainvoke([
+            SystemMessage(content=SUPERVISOR_SUMMARY_PROMPT.format(worker_results=summary)),
+            HumanMessage(content="请整合以上信息，给出最终回答。"),
+        ])
+        return {"phase": "summary", "final_answer": response.content,
+                "messages": [AIMessage(content=response.content)]}
 
-    # 首轮：意图分类 → 返回 next_workers
-    response = await llm_router.ainvoke([...classify intent...])
-    workers = _parse_workers(response.content, VALID_WORKERS)
-    return {"phase": "routing", "next_workers": workers, "worker_results": {}}
-    # ↑ worker_results: {} 触发 merge_results reducer 清空旧值
+    # ── 首轮：意图分类（Checkpointer 恢复的旧状态已被 initial_state 重置）──
+    _RESET = {"worker_results": {}, "final_answer": ""}  # merge_results reducer 遇空字典清空
+
+    # 旁路 A: 识图 → 跳过 Worker，直接进入 summary 阶段
+    if state.get("image"):
+        return {**_RESET, "phase": "summary", "next_workers": []}
+
+    # 旁路 B: 问候/闲聊 → 固定回答
+    if _is_greeting(user_msg):
+        return {**_RESET, "phase": "routing", "next_workers": [],
+                "final_answer": _greeting_response(user_msg),
+                "messages": [AIMessage(content=_greeting_response(user_msg))]}
+
+    # 旁路 C: 天气查询 → 高德 API + LLM 组织回答
+    if is_weather_query(user_msg):
+        weather_info = get_weather("成都", extensions="all")
+        prompt = (f"用户询问：{user_msg}\n\n"
+                  f"以下是高德地图提供的成都天气数据：\n{weather_info}\n\n"
+                  f"请根据以上天气数据，用友好的语气回答用户的问题。"
+                  f"如果用户询问穿衣、带伞等建议，请结合天气情况给出实用建议。")
+        weather_llm = get_llm(state.get("mode", "fast"), state.get("deep_think", False))
+        response = await weather_llm.ainvoke([
+            SystemMessage(content="你是蓉游智体 PandaAgent，根据天气数据为用户提供出行建议。"),
+            HumanMessage(content=prompt),
+        ])
+        return {**_RESET, "phase": "routing", "next_workers": [],
+                "final_answer": _clean_markdown(response.content),
+                "messages": [AIMessage(content=_clean_markdown(response.content))]}
+
+    # 主路径: LLM 意图分类 → 三重兜底
+    try:
+        response = await llm_json.ainvoke([
+            SystemMessage(content=SUPERVISOR_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+        next_workers = safe_json_loads(response.content, {}).get("next_workers", [])
+    except Exception:
+        next_workers = ["qa_worker"]  # 兜底 1: JSON 解析失败默认 QA
+
+    next_workers = [w for w in dict.fromkeys(next_workers) if w in VALID_WORKERS]
+    if not next_workers:
+        next_workers = ["qa_worker"]  # 兜底 2/3: 过滤后为空也默认 QA
+
+    return {**_RESET, "phase": "routing", "next_workers": next_workers}
 ```
 
 关键设计：
@@ -426,49 +485,97 @@ async def supervisor(state: MultiAgentState) -> dict:
 
 **蓉游智体**：`validate_plan()` 是纯 Python 函数，在 Plan Worker 输出后**程序级校验 + 自动修正**，不依赖 LLM 自觉。
 
-**validate_plan 真实源码片段**（`utils.py`）——深拷贝入参 + 逐条规则检测：
+**validate_plan 源码**（`utils.py` L42-175）——深拷贝入参 + 检测型先跑 + R-001 最后强制覆盖：
 
 ```python
 def validate_plan(plan: dict) -> dict:
-    plan = copy.deepcopy(plan)  # ★ 深拷贝，不修改入参
+    plan = copy.deepcopy(plan)          # 深拷贝，不修改入参
     plan.setdefault("rules_applied", [])
+    days = plan.get("days", [])
+    if not days:
+        return plan
+
+    # ── 先执行 R-002~R-008 检测型规则（只记录不修改）──
 
     # R-002: 都江堰+青城山必须同一天，不与市区景点混排
-    for i, day in enumerate(plan.get("days", [])):
-        spots = [day.get(slot, {}).get("spot_name", "")
-                 for slot in ("morning", "afternoon", "evening") if day.get(slot)]
+    for i, day in enumerate(days):
+        spots = [day.get(s, {}).get("spot_name", "")
+                 for s in ("morning", "afternoon", "evening") if day.get(s)]
         has_djq = any("都江堰" in s or "青城山" in s for s in spots)
-        has_urban = any(any(k in s for k in ["宽窄", "锦里", "春熙"]) for s in spots)
+        has_urban = any(any(k in s for k in ["宽窄", "锦里", "春熙", "太古", "武侯祠", "杜甫草堂"])
+                        for s in spots)
         if has_djq and has_urban:
             plan["rules_applied"].append(f"R-002(violated:day{i+1}都江堰与市区混排)")
 
     # R-003: 武侯祠+锦里必须同半天（一墙之隔）
-    for i, day in enumerate(plan["days"]):
+    for i, day in enumerate(days):
         for slot in ("morning", "afternoon"):
             other = "afternoon" if slot == "morning" else "morning"
-            curr = day.get(slot, {}).get("spot_name", "")
-            opp = day.get(other, {}).get("spot_name", "")
+            curr = str(day.get(slot, {}).get("spot_name", ""))
+            opp = str(day.get(other, {}).get("spot_name", ""))
             if ("武侯祠" in curr and "锦里" not in opp) or \
                ("锦里" in curr and "武侯祠" not in opp):
-                plan["rules_applied"].append(f"R-003(violated:day{i+1}.{slot})")
+                plan["rules_applied"].append(f"R-003(violated:day{i+1}.{slot}武侯祠/锦里未同半天)")
 
     # R-005: 金沙/川博周一闭馆
-    for i, day in enumerate(plan["days"]):
-        if (start_date + timedelta(days=i)).weekday() == 0:  # 周一
-            if any("金沙" in s or "川博" in s for s in day_spots):
-                plan["rules_applied"].append(f"R-005(violated:day{i+1}周一)")
+    start_date = plan.get("start_date")
+    if start_date:
+        start = datetime.strptime(start_date, "%Y-%m-%d")
+        for i, day in enumerate(days):
+            if (start + timedelta(days=i)).weekday() == 0:
+                day_spots = [str(day.get(s, {}).get("spot_name", ""))
+                             for s in ("morning", "afternoon", "evening") if day.get(s)]
+                if any("金沙" in s or "四川博物院" in s or "川博" in s for s in day_spots):
+                    plan["rules_applied"].append(f"R-005(violated:day{i+1}周一安排金沙/川博)")
 
-    # R-001: ★ 强制覆盖型——最后执行，主动修改 plan 结构
-    for day in plan["days"]:
-        if 熊猫基地不在当天:
-            把 morning slot 设为熊猫基地 08:00-12:00
-            原 morning 内容移到 afternoon 或 evening
+    # R-006: 每日景点不超过 3 个
+    reserved_keys = {"day", "transit_minutes", "budget", "date"}
+    for i, day in enumerate(days):
+        slot_keys = [k for k in day if k not in reserved_keys and isinstance(day.get(k), dict)]
+        spot_count = sum(1 for k in slot_keys if day[k].get("spot_name"))
+        if spot_count > 3:
+            plan["rules_applied"].append(f"R-006(violated:day{i+1}={spot_count}景点>3)")
+
+    # R-007: 每日通勤总时间不超过 180 分钟
+    for i, day in enumerate(days):
+        transit = day.get("transit_minutes", 0)
+        if isinstance(transit, (int, float)) and transit > 180:
+            plan["rules_applied"].append(f"R-007(violated:day{i+1}通勤{transit}分钟>180)")
+
+    # R-008: 亲子/老人团避免西岭雪山（3000m+）
+    group = str(plan.get("group_type", ""))
+    if group in ("亲子", "老人", "家庭", "带小孩", "带老人"):
+        for i, day in enumerate(days):
+            spots = [str(day.get(s, {}).get("spot_name", ""))
+                     for s in ("morning", "afternoon", "evening") if day.get(s)]
+            if any("西岭雪山" in s for s in spots):
+                plan["rules_applied"].append(f"R-008(violated:day{i+1}亲子/老人团安排西岭雪山)")
+
+    # ── 最后执行 R-001 强制覆盖型（主动修改 plan 结构）──
+    day1_morning = days[0].get("morning", {})
+    morning_spot = str(day1_morning.get("spot_name", ""))
+    if "熊猫" not in morning_spot and "大熊猫" not in morning_spot:
+        original = morning_spot if morning_spot else "（无安排）"
+        days[0]["morning"] = {
+            "spot_name": "成都大熊猫繁育研究基地",
+            "time": "08:00-12:00",
+            "reason": "R-001: 熊猫上午最活跃，必须 Day1 上午",
+            "original_spot": original,
+        }
+        # 原景点挪到下午（如果下午为空）
+        afternoon = days[0].get("afternoon", {})
+        if not afternoon.get("spot_name") and original != "（无安排）":
+            days[0]["afternoon"] = {"spot_name": original, "time": "13:00-17:00",
+                                    "desc": "原 Day1 上午安排，因 R-001 调整"}
+        plan["rules_applied"].append(f"R-001(forced:熊猫基地→Day1上午,原安排[{original}])")
+
+    return plan
 ```
 
 | 规则 | 类型 | 执行时机 | 修正方式 |
 |------|------|---------|---------|
-| R-001 熊猫基地 Day1 08:00-12:00 | **强制覆盖型** | 最后执行 | 把原安排移到下午，熊猫基地插上午 |
-| R-002~R-008 | **检测型** | 先执行 | 只记录到 `plan["rules_applied"]`，不修改 |
+| R-001 熊猫基地 Day1 08:00-12:00 | **强制覆盖型** | 最后执行 | 主动修改 `days[0]["morning"]`，原安排挪下午 + 记录到 `original_spot` |
+| R-002~R-008 | **检测型** | 先执行 | 只 `plan["rules_applied"].append(...)`，不修改 plan 结构 |
 
 为什么 R-001 最后执行？因为它会主动修改 plan 结构；其他 7 条只记录不修改。先跑完检测，再强制覆盖，最后输出的 plan 同时满足两类规则。
 
@@ -484,28 +591,77 @@ def validate_plan(plan: dict) -> dict:
 
 Nearby Worker 还用 Haversine 球面距离（地球半径 6371km）做周边推荐——MySQL 存的是经纬度，Haversine 算直线距离，半径策略：市区 3km / 默认 5km / 郊区 10km。
 
-### 🧩 5. 六模型工厂 + DeepSeek Monkey-Patch——让 LangChain 兼容国产 LLM
+### 🧩 5. 六模型工厂——LangChain 零 Patch，Patch 全在 LlamaIndex
 
-**问题**：DeepSeek Chat API 虽然兼容 OpenAI，但 LangChain 的 `ChatOpenAI` 内部有三处硬编码假设：模型注册表、tiktoken 映射、API 端点路径，直接用会报 `Model xxx not found`。
+**为什么 LangChain 不需要 Patch**：`langchain_openai.ChatOpenAI` 传 `model="deepseek-chat", base_url=...` 就原生兼容，LangChain 0.3 不再硬编码 OpenAI 模型列表。
 
-**解法**：`llm_client.py` 里三步 Monkey-Patch：
+**为什么 LlamaIndex 需要 Patch**：LlamaIndex 的 `llama_index.llms.openai.OpenAI` 有三处硬编码：模型注册表、tiktoken 映射、默认 legacy `/completions` 端点。`_ensure_settings()`（`llama_index_engine.py` L39-102）做了三步 Patch：
 
 ```python
-# 1. 模型注册表注入 4 种 DeepSeek 模型
-ModelRegistry.register_model("deepseek-chat", ...)
-ModelRegistry.register_model("deepseek-v4-pro", ...)
-ModelRegistry.register_model("deepseek-reasoner", ...)
-ModelRegistry.register_model("deepseek-v4-flash-vision", ...)
+# Patch 1: LlamaIndex ALL_AVAILABLE_MODELS 注入 DeepSeek 的 context_window
+from llama_index.llms.openai import utils as _llm_utils
+for m in ("deepseek-chat", "deepseek-v4-pro",
+           "deepseek-reasoner", "deepseek-v4-flash-vision-exp"):
+    _llm_utils.ALL_AVAILABLE_MODELS.setdefault(m, 131072)
 
-# 2. tiktoken 映射到 cl100k_base（DeepSeek 用的 tokenizer）
-MODEL_TO_ENCODING = {"deepseek-chat": "cl100k_base", ...}
+# Patch 2: tiktoken 编码映射（DeepSeek 用 cl100k_base）
+import tiktoken.model as _tiktoken_model
+for m in ("deepseek-chat", "deepseek-v4-pro",
+           "deepseek-reasoner", "deepseek-v4-flash-vision-exp"):
+    _tiktoken_model.MODEL_TO_ENCODING.setdefault(m, "cl100k_base")
 
-# 3. API 端点覆盖为 chat.completions.create()
-original_create = ChatCompletion.create
-def patched_create(*args, **kwargs): ...
+# Patch 3: 覆盖 LlamaIndex OpenAI._complete → chat.completions
+# （DeepSeek 不支持 legacy /completions 端点）
+from llama_index.llms.openai import OpenAI as _LlmOpenAI
+from llama_index.core.llms import CompletionResponse
+
+def _patched_complete(self, prompt, **kwargs):
+    client = self._get_client()
+    resp = client.chat.completions.create(
+        model=self._get_model_name(),
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=kwargs.get("max_tokens", 4096),
+        temperature=kwargs.get("temperature", 0.3),
+        stream=False,
+    )
+    text = resp.choices[0].message.content or ""
+    return CompletionResponse(text=text)
+
+def _patched_acomplete(self, prompt, **kwargs):
+    client = self._get_client()
+    resp = await client.chat.completions.create(
+        model=self._get_model_name(),
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=kwargs.get("max_tokens", 4096),
+        temperature=kwargs.get("temperature", 0.3),
+        stream=False,
+    )
+    text = resp.choices[0].message.content or ""
+    return CompletionResponse(text=text)
+
+_LlmOpenAI._complete = _patched_complete
+_LlmOpenAI._acomplete = _patched_acomplete
 ```
 
-同时预创建 6 个实例（fast / pro / reasoner / vision / json / worker），`get_llm(mode, deep_think)` 工厂选择。`llm_json` 和 `llm_worker` **必须 non-streaming**——否则 JSON 输出/卡片内容会泄漏到聊天的流式响应里。
+**六模型工厂**（`llm_client.py`）：直接 `ChatOpenAI(model=..., base_url=settings.DEEPSEEK_BASE_URL)` 创建，零 Patch：
+
+```python
+def _make_llm(model, temperature=0.3, streaming=True):
+    return ChatOpenAI(
+        model=model, base_url=settings.DEEPSEEK_BASE_URL,
+        api_key=settings.DEEPSEEK_API_KEY, max_retries=3, timeout=120,
+        streaming=streaming,
+    )
+
+llm = _make_llm("deepseek-chat")                # 快速
+llm_pro = _make_llm("deepseek-v4-pro")          # 专家
+llm_reasoner = _make_llm("deepseek-reasoner")   # 深度思考
+llm_vision = _make_llm("deepseek-v4-flash-vision-exp")  # 识图
+llm_json = _make_llm("deepseek-chat", streaming=False).bind(response_format={"type": "json_object"})
+llm_worker = _make_llm("deepseek-chat", streaming=False)  # Worker 专用
+```
+
+`get_llm(mode, deep_think)` 工厂按前端模式选择实例。`llm_json` 和 `llm_worker` **必须 non-streaming**——否则 JSON 输出/卡片内容会泄漏到聊天的流式响应里。
 
 ### 💨 6. SSE 流式 + 4 种事件类型——Worker 卡片先行，最终汇总后推 end
 
@@ -660,54 +816,81 @@ POST /chat → FastAPI 验证请求体 → Lifespan 已预热
 | `structure_ready` | Worker 完成，结构化卡片先行推送 | `{"type": "plan_card", "payload": {...}}` |
 | `end` | Supervisor 最终汇总完成 | `{"final_answer": "...", "session_id": "..."}` |
 
-**chat_stream 真实源码片段**（`chat_routes.py`）——SSE 事件分发核心：
+**chat_stream 源码**（`chat_routes.py` L72-175）——SSE 事件分发核心：
 
 ```python
 async def chat_stream(req: ChatRequest):
-    # 1. 唯一 thread_id：Checkpointer 只在单次请求内有效
+    # 每次请求唯一 thread_id —— Checkpointer 只在单次请求内有效
     _thread_id = f"{req.session_id}_{int(time.time()*1000)}_{uuid4().hex[:8]}"
     config = {"configurable": {"thread_id": _thread_id}}
 
-    # 2. 重置 Checkpointer 恢复的旧中间状态
+    # 重置 Checkpointer 恢复的旧中间状态
     initial_state = {
-        "messages": [HumanMessage(content=req.message)],
+        "messages": [{"role": "user", "content": req.message}],
+        "mode": req.mode,
+        "deep_think": req.deep_think,
+        "smart_search": req.smart_search,
+        "image": req.image,
         "phase": "routing",           # 无 reducer，直接覆盖 checkpoint 旧值
+        "final_answer": "",           # 无 reducer，直接覆盖
         "worker_results": {},         # merge_results 遇空字典清空
-        ...
     }
 
     async def event_generator():
-        emitted_workers = set()  # ★ 去重：同一 Worker 只推一次卡片
-        async with get_checkpointer_async() as saver:
-            graph = build_graph(saver)
+        final_answer = ""
+        emitted_workers = set()       # 去重：同一 Worker 只推一次卡片
+        try:
+            async with get_checkpointer_async() as saver:
+                graph = build_graph(saver)
 
-            # ★ 只用 astream_events 一次，避免 Checkpointer 恢复导致 Worker 跳过
-            async for event in graph.astream_events(initial_state, config, version="v2"):
-                etype = event.get("event")
+                # ★ 只用 astream_events 一次，避免 Checkpointer 恢复导致 Worker 跳过
+                async for event in graph.astream_events(initial_state, config, version="v2"):
+                    etype = event.get("event")
 
-                # ① Token 增量推送（on_chat_model_stream）
-                if etype == "on_chat_model_stream":
-                    token = _clean_markdown(event["data"]["chunk"].content)
-                    yield f"event: token\ndata: {json.dumps({'text': token})}\n\n"
+                    # ① Token 增量推送（LLM 流式输出）
+                    if etype == "on_chat_model_stream":
+                        chunk = event.get("data", {}).get("chunk")
+                        if chunk and hasattr(chunk, "content") and chunk.content:
+                            yield (
+                                f"event: token\n"
+                                f"data: {json.dumps({'text': _clean_markdown(chunk.content)}, ensure_ascii=False)}\n\n"
+                            )
 
-                # ② Worker/Supervisor 完成（on_chain_end）
-                elif etype == "on_chain_end":
-                    output = event["data"].get("output", {})
-                    # 深度思考
-                    if "reasoning" in output:
-                        yield f"event: reasoning\n..."
-                    # Worker 卡片先行推送
-                    if "worker_results" in output:
-                        for wname, content in output["worker_results"].items():
-                            if wname in emitted_workers: continue
-                            emitted_workers.add(wname)
-                            yield f"event: structure_ready\ndata: {json.dumps({'type': WORKER_CARD_MAP[wname], 'payload': content})}\n\n"
-                    # 最终汇总（最后一个 on_chain_end 带 final_answer）
-                    if "final_answer" in output:
-                        final_answer = _clean_markdown(output["final_answer"])
+                    # ② on_chain_end：Worker 完成 → 推卡片；Supervisor 汇总 → 取 final_answer
+                    elif etype == "on_chain_end":
+                        output = event.get("data", {}).get("output", {})
+                        if isinstance(output, dict):
+                            # 深度思考过程 → 推 reasoning 事件
+                            if output.get("reasoning"):
+                                yield (
+                                    f"event: reasoning\n"
+                                    f"data: {json.dumps({'text': output['reasoning']}, ensure_ascii=False)}\n\n"
+                                )
+                            # Worker 结果 → 推 structure_ready 卡片（去重）
+                            if "worker_results" in output:
+                                for wname, content in output["worker_results"].items():
+                                    if wname in emitted_workers:
+                                        continue
+                                    card_type = WORKER_CARD_MAP.get(wname)
+                                    if card_type:
+                                        emitted_workers.add(wname)
+                                        clean = _clean_markdown(content) if isinstance(content, str) else content
+                                        yield (
+                                            f"event: structure_ready\n"
+                                            f"data: {json.dumps({'type': card_type, 'payload': clean}, ensure_ascii=False)}\n\n"
+                                        )
+                            # Supervisor 最终回答
+                            if "final_answer" in output:
+                                final_answer = _clean_markdown(output["final_answer"])
 
-        # ③ 全部结束后推 end
-        yield f"event: end\ndata: {json.dumps({'final_answer': final_answer})}\n\n"
+            # ③ astream_events 结束后推 end 事件
+            yield (
+                f"event: end\n"
+                f"data: {json.dumps({'final_answer': final_answer, 'session_id': req.session_id}, ensure_ascii=False)}\n\n"
+            )
+        except Exception as e:
+            # 异常时推 error 事件，不让前端白屏
+            yield f"event: error\ndata: {json.dumps({'text': str(e)})}\n\n"
 
     return EventSourceResponse(event_generator())
 ```
@@ -824,15 +1007,27 @@ def merge_debug_info(left: dict, right: dict) -> dict:
 
 ### 📋 Worker 调用总览
 
+Supervisor 返回 `next_workers` 列表后，graph.py 的 `route` 条件边函数自动转成 LangGraph Send：
+
 ```python
-# LangGraph Send API — 并行派发，各自独立执行
-return Send([
-    Command(goto=qa_worker, update={...}),
-    Command(goto=plan_worker, update={...}),
-    Command(goto=advice_worker, update={...}),
-    Command(goto=nearby_worker, update={...}),
-])
+# graph.py — 真实的路由函数
+from langgraph.types import Send
+
+def route(state: MultiAgentState):
+    workers = state.get("next_workers", [])
+    if not workers:
+        return [END]
+    # Send(worker_name, state) — 每个 Worker 拿到完整 state 副本，并行执行
+    return [Send(worker, state) for worker in workers]
+
+# graph.py — Worker 执行完自动 join 回 Supervisor 汇总
+workflow.add_edge("qa_worker", "supervisor")
+workflow.add_edge("plan_worker", "supervisor")
+workflow.add_edge("advice_worker", "supervisor")
+workflow.add_edge("nearby_worker", "supervisor")
 ```
+
+**为什么不用 `Command(goto=...)`**：LangGraph 0.2 的 Send API 更轻量——Supervisor 只负责意图分类返回字符串列表，路由逻辑集中在一个 `route` 函数里。如果用 Command，每个 Worker 需要单独的边和 update 字典，N 个 Worker 需要 2N 条边。Send 的 reducer 自动合并 Worker 输出到 `worker_results`，不需要手动在 Command 里指定 update 字段。
 
 Worker 选择逻辑由 Supervisor LLM 输出 JSON 决定，5 条判断规则（见 `SUPERVISOR_PROMPT`）：
 
@@ -1059,8 +1254,14 @@ async def get_checkpointer_async():
             await saver.setup()  # 自动建表
             yield saver
     elif backend == "redis":
-        redis = Redis(host=settings.REDIS_HOST, ...)
-        yield AsyncRedisSaver(redis)
+        from redis.asyncio import Redis as AsyncRedis
+        redis = AsyncRedis(host=settings.REDIS_HOST, port=settings.REDIS_PORT,
+                          db=settings.REDIS_DB, password=settings.REDIS_PASSWORD,
+                          decode_responses=True)
+        try:
+            yield AsyncRedisSaver(redis)
+        finally:
+            await redis.aclose()
     else:
         yield MemorySaver()  # fallback + 日志 warning
 ```
@@ -1079,30 +1280,61 @@ DeepSeek API 完全兼容 OpenAI Chat API，但 LlamaIndex 硬编码了 OpenAI �
 | **Tokenizer 映射** | `tiktoken.model.MODEL_TO_ENCODING` | 映射到 `cl100k_base`（DeepSeek 同款） |
 | **API 端点** | `OpenAI._complete` / `_acomplete` | 覆盖为 `chat.completions.create()`（DeepSeek 不支持 legacy completions） |
 
-**完整 Patch 源码**（`llama_index_engine.py`）——这是让 LlamaIndex 不炸掉的关键：
+**完整 Patch 源码**（`llama_index_engine.py` L39-102）——这是让 LlamaIndex 不炸掉的关键：
 
 ```python
 def _ensure_settings():
+    from llama_index.llms.openai import utils as _llm_utils
+    from llama_index.llms.openai import OpenAI as _LlmOpenAI
+    from llama_index.core.llms import CompletionResponse
+    import tiktoken.model as _tiktoken_model
+
     # Patch 1: 模型注册表注入 context_window=131072
     for m in ("deepseek-chat", "deepseek-v4-pro",
               "deepseek-reasoner", "deepseek-v4-flash-vision-exp"):
-        ALL_AVAILABLE_MODELS.setdefault(m, 131072)
+        _llm_utils.ALL_AVAILABLE_MODELS.setdefault(m, 131072)
 
     # Patch 2: tiktoken 映射到 cl100k_base
-    for m in (...):
-        MODEL_TO_ENCODING.setdefault(m, "cl100k_base")
+    for m in ("deepseek-chat", "deepseek-v4-pro",
+              "deepseek-reasoner", "deepseek-v4-flash-vision-exp"):
+        _tiktoken_model.MODEL_TO_ENCODING.setdefault(m, "cl100k_base")
 
     # Patch 3: 覆盖 legacy completions → chat.completions
+    def _patched_complete(self, prompt, **kwargs):
+        client = self._get_client()
+        resp = client.chat.completions.create(
+            model=self._get_model_name(),
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=kwargs.get("max_tokens", 4096),
+            temperature=kwargs.get("temperature", 0.3),
+            stream=False,
+        )
+        text = resp.choices[0].message.content or ""
+        return CompletionResponse(text=text)
+
     def _patched_acomplete(self, prompt, **kwargs):
+        client = self._get_client()
         resp = await client.chat.completions.create(
             model=self._get_model_name(),
             messages=[{"role": "user", "content": prompt}],
-            ...
+            max_tokens=kwargs.get("max_tokens", 4096),
+            temperature=kwargs.get("temperature", 0.3),
+            stream=False,
         )
-        return CompletionResponse(text=resp.choices[0].message.content)
+        text = resp.choices[0].message.content or ""
+        return CompletionResponse(text=text)
 
-    OpenAI._acomplete = _patched_acomplete
-    OpenAI._complete = _patched_complete
+    _LlmOpenAI._complete = _patched_complete
+    _LlmOpenAI._acomplete = _patched_acomplete
+
+    # ★ 设置真实 LLM
+    Settings.llm = _LlmOpenAI(
+        model=settings.DEEPSEEK_MODEL,
+        api_key=settings.DEEPSEEK_API_KEY,
+        api_base=settings.DEEPSEEK_BASE_URL,
+        temperature=0.3,
+        max_tokens=getattr(settings, "DEEPSEEK_MAX_TOKENS", 4096),
+    )
 ```
 
 为什么要 patch 3？因为 LlamaIndex 的 `ResponseSynthesizer` 默认用 `_complete()`（legacy `/completions` 端点），而 DeepSeek 不支持。不 patch 的话，QA Worker 调 `QueryEngine.aquery()` 会直接报 404。
