@@ -104,45 +104,70 @@
 
 ## 🏗️ 系统架构
 
-```mermaid
-graph TD
-    User("👤 用户") -->|SSE / HTTP| Frontend("🖥️ React 前端<br/>(Vite + Semi UI)")
-    Frontend -->|POST /chat| API("⚡ FastAPI 路由<br/>chat_routes / spot_routes / health")
-    API --> Graph("🧠 LangGraph StateGraph<br/>Supervisor + Send API")
-    
-    subgraph Agent["多智能体层 · LangGraph"]
-        Supervisor("🎯 Supervisor<br/>意图分类 / 并行路由")
-        QA("🔍 QA Worker<br/>RAG 双轨制问答")
-        Plan("📅 Plan Worker<br/>硬规则 + 行程生成")
-        Advice("💡 Advice Worker<br/>六维避坑建议")
-        Nearby("📍 Nearby Worker<br/>Haversine 周边")
-    end
-    
-    Supervisor -->|Send 并行| QA & Plan & Advice & Nearby
-    QA & Plan & Advice & Nearby -->|汇总| Supervisor
-    
-    subgraph RAG["检索增强层 · LlamaIndex + Milvus"]
-        QueryEngine("QueryEngine<br/>Top-K = 5")
-        Embed("BAAI/bge-large-zh-v1.5<br/>1024 维嵌入")
-        Rerank("bge-reranker-large<br/>重排")
-        VectorStore("Milvus Lite<br/>chengdu_spots 集合")
-    end
-    
-    subgraph Data["数据层"]
-        MySQL("🗄️ MySQL 8<br/>景点 / 美食 / 通勤")
-        Seeds("📄 CSV Seeds<br/>1554 景点 / 19w 通勤")
-        Augmented("📊 RAG Augmented<br/>query_variants 12600+ 条")
-    end
-    
-    API --> MySQL
-    QA --> QueryEngine
-    QueryEngine --> VectorStore
-    VectorStore --> Embed
-    QueryEngine --> Rerank
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  👤 用户                                                         │
+│  SSE 流式 / HTTP POST                                            │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  🖥️ 前端 · React 19 + Vite 8 + Semi UI                          │
+│  Chat 页面 → /api/chat → sse.js(EventSourcePolyfill) → 4 回调     │
+│  3 种模式: 文字问答 / 行程规划 / 图片识图                          │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼ POST /chat (SSE)
+┌─────────────────────────────────────────────────────────────────┐
+│  ⚡ FastAPI 0.115 + Uvicorn 0.30                                  │
+│  chat_routes / spot_routes / health_routes                       │
+│  lifespan 启动 Milvus + MySQL；关闭时释放连接                     │
+└──────────────────────────┬──────────────────────────────────────┘
+                           ▼ LangGraph astream_events
+┌─────────────────────────────────────────────────────────────────┐
+│  🧠 多智能体层 · LangGraph StateGraph                              │
+│                                                                   │
+│  ┌─────────────── Supervisor ───────────────┐                    │
+│  │ 意图分类 → Send API 并行派发 → 汇总输出   │                    │
+│  │ 两轮复用同节点: phase=routing / summary  │                    │
+│  └───────┬────────┬────────┬────────┬──────┘                    │
+│          │Send     │Send     │Send     │Send                      │
+│          ▼         ▼         ▼         ▼                          │
+│  ┌──────────┐┌──────────┐┌──────────┐┌──────────┐              │
+│  │QA Worker ││Plan      ││Advice    ││Nearby    │              │
+│  │双轨制RAG ││硬规则+   ││六维避坑 ││Haversine │              │
+│  │          ││validate  ││          ││球面距离  │              │
+│  └────┬─────┘└────┬─────┘└────┬─────┘└────┬─────┘              │
+│       │           │           │           │                       │
+│       └───────────┴───────────┴───────────┘                       │
+│                           ▼ reducer 自动合并 worker_results        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+┌─────────────────┐ ┌─────────────────┐ ┌─────────────────────────┐
+│ 📚 RAG 检索增强  │ │ 🗄️ MySQL 8.0    │ │ 🔧 工具层               │
+│ LlamaIndex +    │ │ 9 张表:         │ │ · 高德天气 (httpx)      │
+│ Milvus Lite     │ │ spots/foods/    │ │ · DuckDuckGo 联网搜索   │
+│                 │ │ avoid_rules/    │ │ · DeepSeek Chat API     │
+│ 向量→BM25→融合  │ │ hard_rules/     │ │   Monkey-Patch 三步适配 │
+│ →Rerank→Boost   │ │ transit_matrix  │ │                         │
+│                 │ │ SQLAlchemy 连接池│ │                         │
+│ BGE-large 1024d │ │ pool_size=10    │ │                         │
+│ + bge-reranker  │ │ pool_recycle=1h │ │                         │
+└─────────────────┘ └─────────────────┘ └─────────────────────────┘
+```
 
-    style Agent fill:#1C3F94,color:#fff
-    style RAG fill:#00A0FF,color:#fff
-    style Data fill:#4479A1,color:#fff
+**请求完整链路**：
+
+```
+POST /chat → Supervisor 意图分类
+  ├─ 问候/天气 → 旁路直接返回（不派发 Worker）
+  ├─ 识图     → vision 模型直接分析（跳过 Worker）
+  └─ 正常     → Send API 并行派发 N 个 Worker
+       ├─ QA → QueryEngine(向量+BM25融合) → Reranker → KeywordBoost → 双轨制 Prompt → LLM
+       ├─ Plan → MySQL 查硬规则+通勤矩阵 → LLM 生成 → validate_plan 8 条校验
+       ├─ Advice → MySQL 查避坑规则 → LLM 六维组织
+       └─ Nearby → MySQL 查坐标 → Haversine 球面距离排序
+  → Supervisor 汇总 → _clean_markdown → SSE 推 end
 ```
 
 ---
