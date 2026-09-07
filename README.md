@@ -156,6 +156,39 @@
 └─────────────────┘ └─────────────────┘ └─────────────────────────┘
 ```
 
+**LangGraph StateGraph 构建**（`graph.py`）：
+
+```python
+def build_graph(checkpointer=None):
+    workflow = StateGraph(MultiAgentState)
+    # 1. 添加节点
+    workflow.add_node("supervisor", supervisor)
+    workflow.add_node("qa_worker", qa_worker)
+    workflow.add_node("plan_worker", plan_worker)
+    workflow.add_node("advice_worker", advice_worker)
+    workflow.add_node("nearby_worker", nearby_worker)
+
+    # 2. 入口 → Supervisor
+    workflow.set_entry_point("supervisor")
+
+    # 3. Supervisor → Send API 并行 fan-out
+    def route(state):
+        return [Send(w, state) for w in state.get("next_workers", [])]
+
+    workflow.add_conditional_edges("supervisor", route)
+
+    # 4. Worker → 自动 join 回 Supervisor 汇总
+    workflow.add_edge("qa_worker", "supervisor")
+    workflow.add_edge("plan_worker", "supervisor")
+    workflow.add_edge("advice_worker", "supervisor")
+    workflow.add_edge("nearby_worker", "supervisor")
+
+    # 5. 编译 + Checkpointer（SqliteSaver 默认）
+    return workflow.compile(checkpointer=checkpointer)
+```
+
+关键：`Send(worker, state)` 让每个 Worker 拿到**完整 state 副本**，并行执行后通过 `worker_results` reducer 自动合并回 Supervisor。Worker 不需要返回 Supervisor，`add_edge(worker, supervisor)` 让 LangGraph 自动 join 回 supervisor 节点触发第二轮汇总。
+
 **请求完整链路**：
 
 ```
@@ -256,26 +289,46 @@ POST /chat → Supervisor 意图分类
 
 `config.py` 用 `BaseSettings` 实现类型安全的单例配置。**为什么用 Pydantic Settings 而不是 yaml/json/toml**：三个理由——类型安全（`MYSQL_PORT: int` 不是字符串 3306）、环境变量自动覆盖（`.env` 不存在时从系统环境变量读，CI/CD 直接注入）、全项目单例（`from app.config import settings` 一行搞定，不传 config 参数）。
 
+**SettingsConfigDict 设计**：
 ```python
-# SettingsConfigDict — 三个关键设计决策
-model_config = SettingsConfigDict(
-    env_file=".../.env",          # .env 文件路径
-    extra="ignore",               # .env 里多写了字段不报错（向后兼容）
-    case_sensitive=True,          # 区分大小写，避免 MYSQL_HOST vs mysql_host 混淆
-)
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=str(Path(__file__).resolve().parent.parent / ".env"),
+        env_file_encoding="utf-8",
+        extra="ignore",        # .env 里多写了字段不报错（向后兼容）
+        case_sensitive=True,   # 区分大小写，避免 MYSQL_HOST vs mysql_host 混淆
+    )
+    DEEPSEEK_MODEL: str = "deepseek-chat"
+    MILVUS_DB_PATH: str = "127.0.0.1:19530"
+    ... # 60+ 字段
 ```
 
-**Milvus Lite 自动切换**：`MILVUS_DB_PATH` 字段一个值决定两种模式——填 `"127.0.0.1:19530"` → Standalone 远程连接；填 `"data/milvus.db"` → Milvus Lite 本地文件存储。`is_milvus_lite` @property 检测 `.db` 后缀，`milvus_uri` @property 自动转换为正确的 URI 格式。本地开发用 Lite（零依赖），生产部署改环境变量切 Standalone。
+**派生属性（@property）真实源码**——为什么不直接存字符串：
 
-**派生属性（@property）**——为什么不直接存字符串：
+```python
+@property
+def mysql_url(self) -> str:
+    """SQLAlchemy MySQL 连接 URL。密码变了不用改 URL 字符串。"""
+    return (f"mysql+pymysql://{self.MYSQL_USER}:{self.MYSQL_PASSWORD}"
+            f"@{self.MYSQL_HOST}:{self.MYSQL_PORT}/{self.MYSQL_DB}"
+            f"?charset={self.MYSQL_CHARSET}")
 
-| 属性 | 计算逻辑 | 为什么不直接存 |
-|------|---------|---------------|
-| `mysql_url` | `mysql+pymysql://user:pass@host:port/db?charset=utf8mb4` | 密码变了不用改 URL，只改 `MYSQL_PASSWORD` |
-| `redis_url` | 有密码时 `redis://:pass@host`，无密码时 `redis://host` | 自动处理密码前缀（Redis URL 密码前要加 `:`） |
-| `is_milvus_lite` | `MILVUS_DB_PATH.endswith(".db")` | 一个字段切两种模式，不用单独的 `MILVUS_MODE` |
-| `milvus_uri` | Lite 返回文件路径，Standalone 返回 `http://host:port` | 适配 MilvusVectorStore 两种连接方式 |
-| `langsmith_enabled` | `LANGCHAIN_TRACING_V2.lower() in ("true", "1", "yes")` | 兼容 `.env` 字符串和系统环境变量 |
+@property
+def is_milvus_lite(self) -> bool:
+    """一个字段切两种模式，不用单独的 MILVUS_MODE 开关。"""
+    return self.MILVUS_DB_PATH.endswith(".db")
+
+@property
+def milvus_uri(self) -> str:
+    """Milvus 连接 URI——Lite 返回文件路径，Standalone 返回 http://host:port"""
+    if self.is_milvus_lite:
+        return self.MILVUS_DB_PATH
+    if self.MILVUS_DB_PATH.startswith("http"):
+        return self.MILVUS_DB_PATH
+    return f"http://{self.MILVUS_DB_PATH}"
+```
+
+**Milvus Lite 自动切换**：`MILVUS_DB_PATH` 一个值决定两种模式——填 `"127.0.0.1:19530"` → Standalone 远程连接；填 `"data/milvus.db"` → Milvus Lite 本地文件存储。`is_milvus_lite` 检测 `.db` 后缀，`milvus_uri` 自动转换为正确的 URI 格式。本地开发用 Lite（零依赖），生产部署改环境变量切 Standalone。
 
 **完整配置表**（按代码顺序）：
 
@@ -310,13 +363,35 @@ model_config = SettingsConfigDict(
 
 **蓉游智体**：Supervisor 通过 `state["phase"]` 字段**两轮复用同一个节点**——首轮 `phase=routing` 做意图分类，次轮 `phase=summary` 做结果汇总。Worker 执行期间 Supervisor 处于"等待 Send 回调"状态，不消耗 LLM Token。
 
+**Supervisor 真实源码**（`nodes.py`）——phase + worker_results 双重判断：
+
 ```python
-# nodes.py — 同一个 supervisor 函数，两轮职责靠 phase 区分
-if state["phase"] == "routing":
-    workers = classify_intent(state["messages"])
-    return Send([build_worker_call(w, state) for w in workers])
-else:  # phase == "summary"
-    return summarize(state["worker_results"])
+async def supervisor(state: MultiAgentState) -> dict:
+    phase = state.get("phase", "routing")
+    worker_results = state.get("worker_results") or {}
+
+    # 第二轮：所有 Worker 执行完毕，汇总输出
+    if phase == "summary" or worker_results:
+        # 识图模式 → vision 模型直接分析
+        if state.get("image"):
+            vision_llm = get_llm("vision", False)
+            response = await vision_llm.ainvoke([...multimodal messages...])
+            return {"phase": "summary", "final_answer": response.content, ...}
+
+        # 无 Worker 结果 → 直接问候回答（不调 LLM）
+        if not worker_results:
+            return {"phase": "summary", "final_answer": _greeting_response(msg), ...}
+
+        # 汇总 Worker 结果 → 调 LLM 生成最终回答
+        prompt = _build_summary_prompt(worker_results)
+        response = await llm_summary.ainvoke(prompt)
+        return {"phase": "summary", "final_answer": response.content, ...}
+
+    # 首轮：意图分类 → 返回 next_workers
+    response = await llm_router.ainvoke([...classify intent...])
+    workers = _parse_workers(response.content, VALID_WORKERS)
+    return {"phase": "routing", "next_workers": workers, "worker_results": {}}
+    # ↑ worker_results: {} 触发 merge_results reducer 清空旧值
 ```
 
 关键设计：
@@ -351,18 +426,51 @@ else:  # phase == "summary"
 
 **蓉游智体**：`validate_plan()` 是纯 Python 函数，在 Plan Worker 输出后**程序级校验 + 自动修正**，不依赖 LLM 自觉。
 
+**validate_plan 真实源码片段**（`utils.py`）——深拷贝入参 + 逐条规则检测：
+
+```python
+def validate_plan(plan: dict) -> dict:
+    plan = copy.deepcopy(plan)  # ★ 深拷贝，不修改入参
+    plan.setdefault("rules_applied", [])
+
+    # R-002: 都江堰+青城山必须同一天，不与市区景点混排
+    for i, day in enumerate(plan.get("days", [])):
+        spots = [day.get(slot, {}).get("spot_name", "")
+                 for slot in ("morning", "afternoon", "evening") if day.get(slot)]
+        has_djq = any("都江堰" in s or "青城山" in s for s in spots)
+        has_urban = any(any(k in s for k in ["宽窄", "锦里", "春熙"]) for s in spots)
+        if has_djq and has_urban:
+            plan["rules_applied"].append(f"R-002(violated:day{i+1}都江堰与市区混排)")
+
+    # R-003: 武侯祠+锦里必须同半天（一墙之隔）
+    for i, day in enumerate(plan["days"]):
+        for slot in ("morning", "afternoon"):
+            other = "afternoon" if slot == "morning" else "morning"
+            curr = day.get(slot, {}).get("spot_name", "")
+            opp = day.get(other, {}).get("spot_name", "")
+            if ("武侯祠" in curr and "锦里" not in opp) or \
+               ("锦里" in curr and "武侯祠" not in opp):
+                plan["rules_applied"].append(f"R-003(violated:day{i+1}.{slot})")
+
+    # R-005: 金沙/川博周一闭馆
+    for i, day in enumerate(plan["days"]):
+        if (start_date + timedelta(days=i)).weekday() == 0:  # 周一
+            if any("金沙" in s or "川博" in s for s in day_spots):
+                plan["rules_applied"].append(f"R-005(violated:day{i+1}周一)")
+
+    # R-001: ★ 强制覆盖型——最后执行，主动修改 plan 结构
+    for day in plan["days"]:
+        if 熊猫基地不在当天:
+            把 morning slot 设为熊猫基地 08:00-12:00
+            原 morning 内容移到 afternoon 或 evening
+```
+
 | 规则 | 类型 | 执行时机 | 修正方式 |
 |------|------|---------|---------|
-| R-001 熊猫基地 Day1 08:00-12:00 | 强制覆盖 | 最后执行 | 把原安排移到下午，熊猫基地插上午 |
-| R-002 都江堰+青城山不同市区混排 | 检测型 | 先执行 | 记录到 `plan["rules_applied"]` |
-| R-003 武侯祠+锦里同半天 | 检测型 | 先执行 | 同上 |
-| R-004 杜甫草堂+金沙同半天 | 检测型 | 先执行 | 同上 |
-| R-005 周一排除金沙/川博 | 检测型 | 先执行 | 同上 |
-| R-006 每日 ≤3 景点 | 检测型 | 先执行 | 同上 |
-| R-007 每日通勤 ≤180 分钟 | 检测型 | 先执行 | 同上 |
-| R-008 亲子/老人排除西岭雪山 | 检测型 | 先执行 | 同上 |
+| R-001 熊猫基地 Day1 08:00-12:00 | **强制覆盖型** | 最后执行 | 把原安排移到下午，熊猫基地插上午 |
+| R-002~R-008 | **检测型** | 先执行 | 只记录到 `plan["rules_applied"]`，不修改 |
 
-为什么 R-001 最后执行？因为它是**强制覆盖型**，会主动修改 plan 结构；其他 7 条是**检测型**，只记录不修改。先跑完检测，再强制覆盖，最后输出的 plan 同时满足两类规则。
+为什么 R-001 最后执行？因为它会主动修改 plan 结构；其他 7 条只记录不修改。先跑完检测，再强制覆盖，最后输出的 plan 同时满足两类规则。
 
 ### 🚇 4. 19 万条通勤矩阵——让 LLM 的行程时间有据可查
 
@@ -422,14 +530,46 @@ event: end             → Supervisor 汇总完成，推最终 Markdown
 
 `main.py` 用 `@asynccontextmanager` 做启动预热和关闭清理。**为什么要预热**：BGE 嵌入模型首次加载需要 30 秒，如果在第一个用户请求时才加载，第一个用户会等 30 秒白屏。预热把这个成本转移到启动阶段。
 
+**lifespan 真实源码**（`main.py`）：
+
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 打印启动 Banner（版本/模型/端口一目了然）
+    logger.info("蓉游智体 PandaAgent 后端服务启动")
+    logger.info(f"  LLM: {settings.DEEPSEEK_MODEL}")
+    logger.info(f"  Milvus: {settings.MILVUS_DB_PATH}")
+    logger.info(f"  Checkpointer: {settings.CHECKPOINT_BACKEND}")
+
+    # 1️⃣ MySQL 连接池预热（SELECT 1 验证）
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("✅ MySQL 连接预热完成")
+    except Exception as e:
+        logger.warning(f"⚠️ MySQL 预热失败：{e}")  # 不阻断启动
+
+    # 2️⃣ LLM 客户端初始化（只 import 不调用，验证 API Key 已配置）
+    try:
+        from app.agents.llm_client import llm
+        logger.info("✅ LLM 客户端初始化完成")
+    except Exception as e:
+        logger.warning(f"⚠️ LLM 初始化失败：{e}")
+
+    # 3️⃣ ★ LlamaIndex Settings 预热——关键！不做会炸
+    try:
+        from app.rag.llama_index_engine import _ensure_settings
+        _ensure_settings()  # 把 BGE Embedding 绑定到 LlamaIndex Settings
+        logger.info("✅ LlamaIndex Settings 预热完成")
+    except Exception as e:
+        logger.warning(f"⚠️ LlamaIndex Settings 预热失败：{e}")
+
+    yield  # 服务开始监听
+
+    logger.info("后端服务关闭")
 ```
-启动顺序（三个 try 块，任何一个失败都不阻断启动）：
-1. MySQL SELECT 1 → 验证连接池可用
-2. import llm → 验证 DeepSeek API Key 已配置
-3. _ensure_settings() → 把 BGE Embedding 绑定到 LlamaIndex Settings（关键！）
-   否则第一个 Worker 调 RAG 时，Settings._embed_model 还是 None
-   → LlamaIndex 尝试自动解析为 OpenAI Embedding → 炸掉
-```
+
+三个 try 块**任何一个失败都不阻断启动**——MySQL 没启动也能先起来，LlamaIndex 预热失败第一个请求会报错但不会让整个服务挂掉。这种"尽力而为"的设计让开发调试时不用等所有依赖就绪。
 
 **CORS 设计决策**：`allow_origins=["*"]` + `allow_credentials=False`。为什么不用精确白名单——Vite proxy 模式下浏览器不会发 CORS（前端和后端同源），但穿透工具（如 Postman 直连）会发。`["*"]` 放开，`credentials=False` 配合（`*` 和 `credentials=True` 在 FastAPI 中不能同时用，浏览器会拒绝携带 Cookie）。
 
@@ -520,6 +660,58 @@ POST /chat → FastAPI 验证请求体 → Lifespan 已预热
 | `structure_ready` | Worker 完成，结构化卡片先行推送 | `{"type": "plan_card", "payload": {...}}` |
 | `end` | Supervisor 最终汇总完成 | `{"final_answer": "...", "session_id": "..."}` |
 
+**chat_stream 真实源码片段**（`chat_routes.py`）——SSE 事件分发核心：
+
+```python
+async def chat_stream(req: ChatRequest):
+    # 1. 唯一 thread_id：Checkpointer 只在单次请求内有效
+    _thread_id = f"{req.session_id}_{int(time.time()*1000)}_{uuid4().hex[:8]}"
+    config = {"configurable": {"thread_id": _thread_id}}
+
+    # 2. 重置 Checkpointer 恢复的旧中间状态
+    initial_state = {
+        "messages": [HumanMessage(content=req.message)],
+        "phase": "routing",           # 无 reducer，直接覆盖 checkpoint 旧值
+        "worker_results": {},         # merge_results 遇空字典清空
+        ...
+    }
+
+    async def event_generator():
+        emitted_workers = set()  # ★ 去重：同一 Worker 只推一次卡片
+        async with get_checkpointer_async() as saver:
+            graph = build_graph(saver)
+
+            # ★ 只用 astream_events 一次，避免 Checkpointer 恢复导致 Worker 跳过
+            async for event in graph.astream_events(initial_state, config, version="v2"):
+                etype = event.get("event")
+
+                # ① Token 增量推送（on_chat_model_stream）
+                if etype == "on_chat_model_stream":
+                    token = _clean_markdown(event["data"]["chunk"].content)
+                    yield f"event: token\ndata: {json.dumps({'text': token})}\n\n"
+
+                # ② Worker/Supervisor 完成（on_chain_end）
+                elif etype == "on_chain_end":
+                    output = event["data"].get("output", {})
+                    # 深度思考
+                    if "reasoning" in output:
+                        yield f"event: reasoning\n..."
+                    # Worker 卡片先行推送
+                    if "worker_results" in output:
+                        for wname, content in output["worker_results"].items():
+                            if wname in emitted_workers: continue
+                            emitted_workers.add(wname)
+                            yield f"event: structure_ready\ndata: {json.dumps({'type': WORKER_CARD_MAP[wname], 'payload': content})}\n\n"
+                    # 最终汇总（最后一个 on_chain_end 带 final_answer）
+                    if "final_answer" in output:
+                        final_answer = _clean_markdown(output["final_answer"])
+
+        # ③ 全部结束后推 end
+        yield f"event: end\ndata: {json.dumps({'final_answer': final_answer})}\n\n"
+
+    return EventSourceResponse(event_generator())
+```
+
 **Worker → 卡片类型映射**：
 
 | Worker | 卡片类型 | 前端组件 |
@@ -530,10 +722,9 @@ POST /chat → FastAPI 验证请求体 → Lifespan 已预热
 | `nearby_worker` | `nearby_list` | NearbyList |
 
 **关键实现细节**：
-- `stream_events` 只用 **一次**，避免 Checkpointer 恢复导致 Worker 跳过
+- `astream_events` 只用 **一次**——LangGraph 如果分两次调，第二次会从 Checkpointer 恢复后跳过已执行的 Worker
 - 每个请求生成唯一 `thread_id = {session_id}_{timestamp}_{uuid8}`，跨请求永不串状态
 - `initial_state` 手动重置 `phase/worker_results/final_answer`，覆盖 Checkpointer 恢复的旧中间状态
-- `_clean_markdown()` 轻量清洗：保留 ## 标题、列表、表格、引用块，去除 `**加粗**`、`代码标记`、`--- 分隔线`
 - `structure_ready` 去重：`emitted_workers` 集合确保同一 Worker 只推一次卡片
 
 ---
@@ -558,9 +749,53 @@ POST /chat → FastAPI 验证请求体 → Lifespan 已预热
 | `session_id` | str | — | 会话 ID |
 | `debug_info` | dict | `merge_debug_info` | 各节点耗时、token 数，逐层 deep merge |
 
-**自定义 reducer 逻辑**：
-- `merge_results`：right 为空字典时 → 完全替换 left（routing 阶段清空旧中间状态）；正常 Worker 输出时 → 合并
-- `merge_debug_info`：递归 deep merge，不覆盖已有节点的统计
+**MultiAgentState 完整定义**（`agent_models.py`）：
+
+```python
+class MultiAgentState(TypedDict, total=False):
+    # 核心流转字段
+    messages: Annotated[list, add_messages]          # LangGraph 一等字段，Checkpointer 自动持久化
+    next_workers: list                                # Supervisor 意图分类结果
+    worker_results: Annotated[dict, merge_results]   # 并行 Worker 输出合并
+    final_answer: str                                 # Supervisor 汇总结果
+    reasoning: str                                    # 深度思考过程
+    phase: Literal["routing", "summary"]              # 两轮标识
+
+    # 运行模式（前端传入）
+    mode: Literal["fast", "expert", "vision"]
+    deep_think: bool
+    smart_search: bool
+    image: str
+
+    # 多租户
+    user_id: str
+    session_id: str
+
+    # 可观测
+    debug_info: Annotated[dict, merge_debug_info]
+```
+
+**自定义 reducer 源码**（`agent_models.py`）：
+
+```python
+def merge_results(left: dict, right: dict) -> dict:
+    """并行 Worker 结果合并。right 为空字典时 → 完全清空 left
+    （routing 阶段 Supervisor 返回 {} 重置旧中间状态）。
+    正常 Worker 输出时 → right 覆盖 left 同名 key。"""
+    if right is not None and len(right) == 0:
+        return {}
+    return {**(left or {}), **(right or {})}
+
+def merge_debug_info(left: dict, right: dict) -> dict:
+    """调试信息 deep merge，不覆盖已有节点的统计。"""
+    merged = {**(left or {})}
+    for k, v in (right or {}).items():
+        if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
+            merged[k] = {**merged[k], **v}
+        else:
+            merged[k] = v
+    return merged
+```
 
 ---
 
@@ -697,18 +932,51 @@ SELECT template_json FROM itinerary_templates LIMIT 5
 
 **为什么要 Bounding Box**：Haversine 公式对每个景点都要算一次 sin/cos，1554 个景点就是 1554 次三角函数。先用经纬度做 Bounding Box 粗筛（`1° ≈ 111km`，SQL 直接 BETWEEN），把候选集从 1554 降到几十，再用 Haversine 精算，速度提升 10-50x。
 
-```sql
--- Bounding Box 预过滤（1°≈111km）
-SELECT spot_name, longitude, latitude, rating FROM spots
-WHERE longitude BETWEEN :lon_min AND :lon_max
-  AND latitude BETWEEN :lat_min AND :lat_max
+**Nearby Worker 真实源码**（`nodes.py`）：
+
+```python
+async def nearby_worker(state: MultiAgentState) -> dict:
+    # 1. LLM 识别目标景点 + 半径
+    result = safe_json_loads(await llm_json.ainvoke([NEARBY_PROMPT, user_msg]), {})
+    target_spot = result.get("spot_name", "")
+    radius_km = float(result.get("radius_km", 5))
+
+    # 2. 查目标坐标
+    target = conn.execute(
+        text("SELECT longitude, latitude FROM spots WHERE spot_name=:name"),
+        {"name": target_spot},
+    ).fetchone()
+    lon, lat = float(target[0]), float(target[1])
+
+    # 3. ★ Bounding Box 预过滤（1°≈111km，SQL BETWEEN 秒级）
+    delta = radius_km / 111.0
+    all_spots = conn.execute(text("""
+        SELECT spot_name, longitude, latitude, rating FROM spots
+        WHERE longitude BETWEEN :lon_min AND :lon_max
+          AND latitude BETWEEN :lat_min AND :lat_max
+    """), {
+        "lon_min": lon - delta, "lon_max": lon + delta,
+        "lat_min": lat - delta, "lat_max": lat + delta,
+    }).fetchall()
+
+    # 4. Haversine 精算 + 排序
+    nearby = []
+    for s in all_spots:
+        dist = haversine(lon, lat, float(s[1]), float(s[2]))
+        if 0 < dist <= radius_km:
+            nearby.append({"name": s[0], "distance_km": dist, "rating": s[3]})
+    nearby.sort(key=lambda x: x["distance_km"])
+    return {"worker_results": {"nearby_worker": nearby[:10]}}
 ```
 
 **Haversine 公式**（`utils.py`）：
 ```python
 def haversine(lon1, lat1, lon2, lat2):
     R = 6371.0  # 地球半径 km
-    ...
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    return R * 2 * atan2(sqrt(a), sqrt(1-a))
 ```
 
 **排序 + 截断**：按 `distance_km` 升序排，取 TOP 10，返回 `[{"name": "...", "distance_km": 1.2, "rating": 4.8}, ...]`——直接传 list 不做 `json.dumps`，前端 NearbyList 直接解析。
@@ -774,7 +1042,30 @@ requests.post("https://html.duckduckgo.com/html/",
 | **RedisSaver** | 高并发 | Redis Stack（RedisJSON + RediSearch） |
 | **MemorySaver** | 调试 | 不跨重启，进程退出即丢失 |
 
-设计要点：异步用 `@asynccontextmanager` 做资源生命周期管理（Postgres 需 `AsyncConnectionPool`，Redis 需 `aclose()`）。
+**工厂源码**（`checkpoint_factory.py`）——四种后端一个入口：
+
+```python
+@asynccontextmanager
+async def get_checkpointer_async():
+    backend = settings.CHECKPOINT_BACKEND.lower()
+    if backend == "sqlite":
+        async with AsyncSqliteSaver.from_conn_string(
+            settings.CHECKPOINT_SQLITE_PATH
+        ) as saver:
+            yield saver
+    elif backend == "postgres":
+        pool = AsyncConnectionPool(conninfo=settings.CHECKPOINT_POSTGRES_URI)
+        async with AsyncPostgresSaver(pool) as saver:
+            await saver.setup()  # 自动建表
+            yield saver
+    elif backend == "redis":
+        redis = Redis(host=settings.REDIS_HOST, ...)
+        yield AsyncRedisSaver(redis)
+    else:
+        yield MemorySaver()  # fallback + 日志 warning
+```
+
+设计要点：`@asynccontextmanager` 确保异步资源（Postgres `AsyncConnectionPool` / Redis `aclose()`）在退出时自动释放。SqliteSaver 用 `from_conn_string` 自动开 WAL 模式，避免多进程 `database is locked`。
 
 ---
 
@@ -788,6 +1079,34 @@ DeepSeek API 完全兼容 OpenAI Chat API，但 LlamaIndex 硬编码了 OpenAI �
 | **Tokenizer 映射** | `tiktoken.model.MODEL_TO_ENCODING` | 映射到 `cl100k_base`（DeepSeek 同款） |
 | **API 端点** | `OpenAI._complete` / `_acomplete` | 覆盖为 `chat.completions.create()`（DeepSeek 不支持 legacy completions） |
 
+**完整 Patch 源码**（`llama_index_engine.py`）——这是让 LlamaIndex 不炸掉的关键：
+
+```python
+def _ensure_settings():
+    # Patch 1: 模型注册表注入 context_window=131072
+    for m in ("deepseek-chat", "deepseek-v4-pro",
+              "deepseek-reasoner", "deepseek-v4-flash-vision-exp"):
+        ALL_AVAILABLE_MODELS.setdefault(m, 131072)
+
+    # Patch 2: tiktoken 映射到 cl100k_base
+    for m in (...):
+        MODEL_TO_ENCODING.setdefault(m, "cl100k_base")
+
+    # Patch 3: 覆盖 legacy completions → chat.completions
+    def _patched_acomplete(self, prompt, **kwargs):
+        resp = await client.chat.completions.create(
+            model=self._get_model_name(),
+            messages=[{"role": "user", "content": prompt}],
+            ...
+        )
+        return CompletionResponse(text=resp.choices[0].message.content)
+
+    OpenAI._acomplete = _patched_acomplete
+    OpenAI._complete = _patched_complete
+```
+
+为什么要 patch 3？因为 LlamaIndex 的 `ResponseSynthesizer` 默认用 `_complete()`（legacy `/completions` 端点），而 DeepSeek 不支持。不 patch 的话，QA Worker 调 `QueryEngine.aquery()` 会直接报 404。
+
 ---
 
 ## 🎨 BGE Embedding 细节
@@ -798,6 +1117,29 @@ BGE v1.5 官方规定：**Query 路径必须加 instruction 前缀**，否则召
 |------|------|----------|
 | Query | `"为这个句子生成表示以用于检索相关文章："` + 用户问题 | ✅ |
 | Document | 无，直接编码 | ✅ |
+
+**EmbeddingService 源码**（`embeddings.py`）——封装成 LlamaIndex `BaseEmbedding` 接口：
+
+```python
+class EmbeddingService(BaseEmbedding):
+    def __init__(self):
+        self._model = SentenceTransformer(
+            settings.EMBED_MODEL_NAME, device=settings.EMBED_DEVICE
+        )
+
+    def _get_query_embedding(self, query: str) -> List[float]:
+        # ★ BGE 强制：Query 路径加 instruction 前缀
+        prompted = BGE_QUERY_PREFIX + query
+        return self._model.encode(
+            prompted, normalize_embeddings=True, convert_to_numpy=True
+        ).tolist()
+
+    def _get_text_embedding(self, text: str) -> List[float]:
+        # 文档路径：不加前缀，直接编码
+        return self._model.encode(
+            text, normalize_embeddings=True, convert_to_numpy=True
+        ).tolist()
+```
 
 LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`（景点名）拼入文本头部，增强名称匹配权重。BM25 用单字 `token_pattern=r"[\u4e00-\u9fa5]|[a-zA-Z0-9]+"` 避免中文分词后查询无法对齐。
 
@@ -836,10 +1178,30 @@ LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`�
 
 **QueryFusionRetriever 参数**：`mode="simple"`（两种检索器等权融合）、`num_queries=1`（不做 Query Decomposition）、`similarity_top_k=20`
 
-**KeywordBoostPostprocessor 逻辑**：
-- `boost=1.5` 基础乘数
-- `source_name` 与 query 有字符重叠 → `score × (1 + 0.1 × 重叠字数) × 1.5`
-- `chunk_type == "travel_tips"`（含票价/开放时间等硬事实）→ 额外 `score × 1.3`
+**KeywordBoostPostprocessor 源码**（`llama_index_engine.py`）——重写了 LlamaIndex 没有的"关键词加权后处理"：
+
+```python
+class KeywordBoostPostprocessor:
+    def __init__(self, boost: float = 1.5):
+        self.boost = boost
+
+    def postprocess_nodes(self, nodes, query_str=None, **kwargs):
+        if not query_str:
+            return nodes
+        query_chars = set(query_str)
+        for n in nodes:
+            # 景点名与 query 字符重叠 → score × (1 + 0.1 × 重叠字数) × 1.5
+            name = str(n.metadata.get("source_name", ""))
+            overlap = len(set(name) & query_chars)
+            if overlap > 0:
+                n.score = (n.score or 0.0) * (1 + 0.1 * overlap) * self.boost
+            # travel_tips 含票价/开放时间等硬事实 → 额外 × 1.3
+            if n.metadata.get("chunk_type") == "travel_tips":
+                n.score = (n.score or 0.0) * 1.3
+        return sorted(nodes, key=lambda x: x.score or 0.0, reverse=True)
+```
+
+**QueryFusionRetriever 参数**：`mode="simple"`（两种检索器等权融合）、`num_queries=1`（不做 Query Decomposition）、`similarity_top_k=20`
 
 **Response Synthesizer**：`response_mode="compact"`，避免重复检索内容灌入 Prompt
 
