@@ -120,6 +120,36 @@ graph TD
 
 ---
 
+## ⚙️ 配置中心（Pydantic Settings）
+
+`config.py` 用 `BaseSettings` 实现类型安全的单例配置，`.env` 文件注入 + 环境变量覆盖。全项目 `from app.config import settings` 统一访问。
+
+| 分组 | 关键配置 | 默认值 | 说明 |
+|------|---------|--------|------|
+| **LLM** | `DEEPSEEK_MODEL` | `deepseek-chat` | 快速模式 |
+| | `DEEPSEEK_MODEL_PRO` | `deepseek-v4-pro` | 专家模式 |
+| | `DEEPSEEK_MODEL_REASONER` | `deepseek-reasoner` | 深度思考（带 `<think>`） |
+| | `DEEPSEEK_MODEL_VISION` | `deepseek-v4-flash-vision-exp` | 识图模式 |
+| **高德** | `AMAP_API_KEY` | `""` | 天气 + 通勤矩阵计算 |
+| **MySQL** | `MYSQL_DB` | `chengdu_travel` | 9 张表 |
+| **Milvus** | `MILVUS_DB_PATH` | `127.0.0.1:19530` | Standalone 地址，`.db` 后缀自动切 Lite |
+| | `MILVUS_COLLECTION_SPOTS` | `chengdu_spots` | RAG 集合 |
+| | `MILVUS_COLLECTION_LTM` | `user_ltm_v1` | LTM 用户画像集合 |
+| | `MILVUS_DIM` | `1024` | BGE 向量维度 |
+| **LTM** | `LTM_DEDUP_THRESHOLD` | `0.92` | 语义去重阈值 |
+| **Embedding** | `EMBED_MODEL_NAME` | `BAAI/bge-large-zh-v1.5` | 中文嵌入 |
+| | `RERANKER_MODEL_NAME` | `BAAI/bge-reranker-large` | 重排器 |
+| **Checkpoint** | `CHECKPOINT_BACKEND` | `sqlite` | 可选 memory/redis/postgres |
+| **LangSmith** | `LANGCHAIN_TRACING_V2` | `true` | 全链路追踪开关 |
+
+**派生属性**（`@property`）：
+- `mysql_url` → `mysql+pymysql://user:pass@host:port/db?charset=utf8mb4`
+- `redis_url` → `redis://[:pass]@host:port/db`（有密码时带 `:` 前缀）
+- `is_milvus_lite` → `MILVUS_DB_PATH.endswith(".db")`
+- `milvus_uri` → Lite 返回文件路径，Standalone 返回 `http://host:port`
+
+---
+
 ## ✨ 核心特性
 
 ### 🎯 1. Supervisor 多意图并行路由
@@ -411,6 +441,25 @@ Supervisor 不是单一节点，而是**同一节点承担两轮职责**，通�
 
 ---
 
+## 🛡️ validate_plan 8 条硬规则程序级实现
+
+`utils.py` 的 `validate_plan(plan)` 深拷贝入参后逐条检查，结果写入 `plan["rules_applied"]`。与 Prompt 注入形成**双保险**——LLM 可能漏看 Prompt 里的规则，但 Python 代码不会。
+
+| 编号 | 规则 | 类型 | 实现要点 |
+|------|------|------|---------|
+| **R-001** | 熊猫基地必须 Day1 7:30-12:00 | 🔴 **强制覆盖**（最后执行） | 原安排挪到下午或记录到 `original_spot` 字段，保留用户意图 |
+| R-002 | 都江堰+青城山必须同天，不与市区混排 | 🟡 检测 | 遍历每天 slots，关键词匹配"都江堰/青城山"+"宽窄/锦里/春熙/武侯祠/杜甫草堂" |
+| R-003 | 武侯祠+锦里必须同半天（一墙之隔） | 🟡 检测 | 检查 morning/afternoon 是否同时包含两个景点 |
+| R-004 | 杜甫草堂+金沙遗址同半天（车程 15 分钟） | 🟡 检测 | 同上 |
+| R-005 | 金沙/川博周一闭馆 | 🟡 检测 | `weekday() == 0` 时排除"金沙/四川博物院/川博" |
+| R-006 | 每日景点 ≤ 3 个 | 🟡 检测 | 统计非 reserved_keys 的 slot 数 |
+| R-007 | 每日通勤 ≤ 180 分钟 | 🟡 检测 | `transit_minutes > 180` |
+| R-008 | 亲子/老人团避免西岭雪山（3000m+） | 🟡 检测 | `group_type in ("亲子","老人","家庭")` + "西岭雪山" |
+
+**执行顺序关键**：R-001 放在最后执行——它是**强制覆盖型**规则，会修改 plan 结构；其他 7 条是**检测型**，只记录不修改。如果先执行 R-001，它插入熊猫基地后，后面的检测规则会误报新插入内容。
+
+---
+
 ## 🔴 Checkpointer 工厂模式
 
 `get_checkpointer_async()` 按 `CHECKPOINT_BACKEND` 环境变量一行切换后端：
@@ -448,6 +497,48 @@ BGE v1.5 官方规定：**Query 路径必须加 instruction 前缀**，否则召
 | Document | 无，直接编码 | ✅ |
 
 LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`（景点名）拼入文本头部，增强名称匹配权重。BM25 用单字 `token_pattern=r"[\u4e00-\u9fa5]|[a-zA-Z0-9]+"` 避免中文分词后查询无法对齐。
+
+---
+
+## 🔍 RAG 混合检索完整链路
+
+`build_query_engine()` 组装了一条 5 级流水线：
+
+```
+用户 Query
+    │
+    ├─→ VectorIndexRetriever（BGE 向量 Top10）──┐
+    ├─→ BM25Retriever（关键词 Top10）──────────┤
+    │                                          ↓
+    │                              QueryFusionRetriever（mode=simple, reciprocal_rerank）
+    │                                          │
+    │                                          ↓ Top20
+    │                              BGE Reranker（SentenceTransformerRerank）
+    │                                          │
+    │                                          ↓ Top3
+    │                              KeywordBoostPostprocessor（自定义后处理）
+    │                                          │
+    │                              ┌───────────┴───────────┐
+    │                              ↓                       ↓
+    │                      source_name 重叠加权      travel_tips 块类型加权
+    │                      score × (1 + 0.1 × overlap) × 1.5   score × 1.3
+    │                              │
+    │                              ↓
+    │                       DynamicTextQAPrompt（双轨制 Prompt）
+    │                              │
+    └──────────────────────────────┴
+                                   ↓
+                            LLM 生成最终回答
+```
+
+**QueryFusionRetriever 参数**：`mode="simple"`（两种检索器等权融合）、`num_queries=1`（不做 Query Decomposition）、`similarity_top_k=20`
+
+**KeywordBoostPostprocessor 逻辑**：
+- `boost=1.5` 基础乘数
+- `source_name` 与 query 有字符重叠 → `score × (1 + 0.1 × 重叠字数) × 1.5`
+- `chunk_type == "travel_tips"`（含票价/开放时间等硬事实）→ 额外 `score × 1.3`
+
+**Response Synthesizer**：`response_mode="compact"`，避免重复检索内容灌入 Prompt
 
 ---
 
@@ -502,6 +593,145 @@ LlamaIndex 从 Milvus 全量加载节点建 BM25 索引时，把 `source_name`�
 | `dlq` | 死信队列（archive / ltm_extract / notify） | 异步重试 |
 
 **联网搜索降级策略**：`web_search()` 基于 DuckDuckGo HTML 搜索，国内不稳定时失败返回空字符串，Agent 自动退化为纯本地 RAG 回答。
+
+---
+
+## 🗄️ 数据库表结构（9 张表）
+
+### spots — 景点（1554 条）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `spot_id` | INT PK | 自增主键 |
+| `spot_name` | VARCHAR(128) | 景点名称 |
+| `spot_level` | VARCHAR(16) | 5A/4A/3A/- |
+| `longitude` / `latitude` | DECIMAL(10,7) | 精确到 0.0000001 度（~1cm） |
+| `rating` | DECIMAL(3,1) | 0-5 评分 |
+| `ticket_price_min` | INT | 最低门票（元） |
+| `opening_hours_json` | JSON | `{open: "08:00", close: "18:00"}` |
+| `area_tag` | VARCHAR(32) | 所属区县（成华区/武侯区...） |
+| `description` / `travel_tips` / `cultural_context` | TEXT | RAG 向量化三大长文本 |
+
+**索引**：`idx_spots_name`（名称模糊搜索）、`idx_spots_area`（区域过滤）、`idx_spots_location(longitude, latitude)`（Haversine 半径查询）
+
+### transit_matrix — 通勤矩阵（190,157 条）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `from_spot_id` / `to_spot_id` | INT | 景点 ID |
+| `transit_mode` | ENUM | `driving` / `transit` / `walking` |
+| `duration_min` | INT | 通勤分钟数 |
+| `distance_km` | DECIMAL(8,2) | 公里数 |
+| `same_region` | BOOLEAN | 是否同区域（Plan Worker 优先同区域景点） |
+
+**约束**：`UNIQUE(from_spot_id, to_spot_id, transit_mode)` 避免重复计算；双向覆盖（A→B 和 B→A 各一条）
+
+### hard_rules — 硬规则（53 条）
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `rule_id` | VARCHAR(16) PK | R-001 ~ R-053 |
+| `rule_content` | TEXT | 规则内容（注入 Prompt） |
+| `priority` | INT | 数字越小越高，Plan Worker 按 ASC 排序注入 |
+
+### user_profiles — LTM 硬槽位
+
+| 字段 | 类型 | Enum 取值 |
+|------|------|----------|
+| `group_type` | ENUM | solo / couple / family / friends / business / senior |
+| `budget_level` | ENUM | budget / standard / comfort / luxury |
+| `pace` | ENUM | relaxed / moderate / packed |
+| `allergies_json` / `must_include_json` / `must_exclude_json` | JSON | 忌口 / 必去 / 黑名单 |
+| `ltm_chunk_count` | INT | 累计 LTM 提取次数（防频繁覆盖） |
+
+### dlq — 死信队列
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `phase` | ENUM | archive / ltm_extract / notify |
+| `payload_json` | JSON | 原 state / profile 快照（支持手动重试） |
+| `retry_count` | INT | 已重试次数 |
+| `next_retry_at` | DATETIME | 下次重试时间 |
+
+**索引**：`idx_dlq_phase_retry(phase, next_retry_at)` 支持定时扫描待重试死信
+
+---
+
+## 🧩 前端组件细节
+
+### PlanCard — 行程规划卡片
+
+- `parsePlan()` 兼容两种 payload：dict（`{days, title, budget, rules_applied}`）和数组
+- `renderSpot()` 渲染 `{spot_name, time, desc}` → `"⏰ 08:00-12:00 · 熊猫基地 · 上午最活跃"`
+- 每天分 ☀️ 上午 / 🌤️ 下午 / 🌙 晚上 三个 slot，时间线布局
+- 预算 Tag（蓝色）+ 硬规则 Tag（绿色，显示规则条数）
+- `rules_applied` 数组直接展示 LLM 触发的规则违规/强制记录
+
+### QACard — 知识库问答卡片
+
+- 接收 `qa_worker` 的 `structure_ready` payload
+- `parseQA()` 兼容 `{answer, citations}` 和 `{summary, sources}` 两种字段名
+- 引用出处用 `CitationTag` 组件展示（标签化显示来源景点名）
+- `whiteSpace: 'pre-wrap'` 保留后端 `_clean_markdown()` 清洗后的换行
+
+### ChatInput — 输入框
+
+- 三模式切换：Fast / Expert / Vision
+- Vision 模式支持图片上传（`type="file"` → base64 dataURL）
+- `smart_search` 开关（联网搜索）
+- `deep_think` 开关（深度思考）
+
+### App.jsx — 主应用状态
+
+- `sessions` / `activeSessionId` / `messages` 三级状态
+- `handleSend()` 调 `chatApi.streamChat()`，注册 4 个回调：`onToken` / `onReasoning` / `onStructure` / `onEnd`
+- 返回 abort 函数，切换会话时取消前一个请求
+- Sidebar 新建会话时生成随机 `session_id`（UUID 截断）
+
+### vite.config.js — SSE 代理
+
+```js
+proxy: {
+  '/api': {
+    target: 'http://localhost:8000',
+    changeOrigin: true,
+    configure: (proxy) => {
+      proxy.on('proxyReq', (proxyReq) => {
+        proxyReq.setHeader('X-Accel-Buffering', 'no')  // Nginx 禁用缓冲
+      })
+    }
+  }
+}
+```
+
+---
+
+## 📝 日志与运维
+
+### Loguru 日志系统（`logger.py`）
+
+双输出：控制台彩色 + 文件按天轮转。
+
+| 输出 | 格式 | 轮转 | 保留 |
+|------|------|------|------|
+| 控制台 stderr | `<green>time</green> \| <level>LEVEL</level> \| <cyan>name:function:line</cyan> - message` | — | — |
+| 文件 `app_YYYY-MM-DD.log` | `time \| LEVEL \| name:function:line - message` | 每天零点 | 30 天 |
+
+关键配置：`enqueue=True` 异步写入，避免多进程阻塞；`encoding="utf-8"` 支持中文日志。
+
+### MySQL 连接池（`mysql_client.py`）
+
+```python
+engine = create_engine(
+    settings.mysql_url,
+    pool_pre_ping=True,   # 连接前 ping，避免使用 MySQL 已关闭的连接
+    pool_recycle=3600,    # 1 小时主动回收，与 MySQL wait_timeout 对齐
+    pool_size=10,         # 常驻 10 个连接
+    max_overflow=20,      # 高峰最多 30 个
+)
+```
+
+FastAPI 依赖注入 `get_db()`：请求 yield SessionLocal，finally 自动 close，确保连接不泄漏。
 
 ---
 
