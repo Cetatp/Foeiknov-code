@@ -17,13 +17,16 @@
 
 > 点击任意链接可跳转到对应板块。
 
+<table>
+<tr>
+<td>
+
 <details>
 <summary><b>🧭 项目概述</b></summary>
 
 - 🎯 [项目定位](#🧭-项目定位)
 - 🏗️ [系统架构](#🏗️-系统架构)
 - 🧰 [技术栈](#🧰-技术栈)
-  - ⚡ 后端框架 & 中间件 · 🤖 AI Agent 核心 · 📚 RAG 检索增强 · 💾 数据层 · 🖥️ 前端 · 🔧 工具 & 运维 · 🛠️ 外部 API
 - ⚙️ [配置中心](#⚙️-配置中心pydantic-settings)
 
 </details>
@@ -40,9 +43,11 @@
 - 🧠 [LangGraph State Schema](#🧠-langgraph-state-schema)
 - 🧩 [LLM 多模型工厂](#🧩-llm-多模型工厂)
 - 👷 [四个 Worker 实现细节](#👷-四个-worker-实现细节)
-  - 📋 调用总览 · 🔍 QA Worker · 📅 Plan Worker · 💡 Advice Worker · 📍 Nearby Worker
 
 </details>
+
+</td>
+<td>
 
 <details>
 <summary><b>🔍 RAG & 检索链路</b></summary>
@@ -63,6 +68,11 @@
 
 </details>
 
+</td>
+</tr>
+<tr>
+<td>
+
 <details>
 <summary><b>🖥️ 前端 & 数据</b></summary>
 
@@ -74,6 +84,9 @@
 
 </details>
 
+</td>
+<td>
+
 <details open>
 <summary><b>🚀 快速入口 & 其他</b></summary>
 
@@ -84,6 +97,10 @@
 - 📄 [License](#📄-license)
 
 </details>
+
+</td>
+</tr>
+</table>
 
 ---
 
