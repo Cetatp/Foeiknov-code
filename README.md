@@ -17,60 +17,73 @@
 
 > 点击任意链接可跳转到对应板块。
 
-### 项目概述
+<details>
+<summary><b>🧭 项目概述</b></summary>
 
-| 板块 | 链接 |
-|------|------|
-| 项目定位 | [解决什么问题](#解决什么问题) · [Agent 架构特色](#agent-架构特色) · [数据规模](#数据规模) · [与传统 RAG 的差异化](#与传统-rag-的差异化) |
-| 系统架构 | [架构图 + LangGraph StateGraph 构建代码](#系统架构) |
-| 技术栈 | [后端框架 & 中间件](#后端框架--中间件) · [AI Agent 核心](#ai-agent-核心langgraph--langchain-生态) · [RAG 检索增强](#rag-检索增强llamaindex--milvus--bge) · [数据层](#数据层) · [前端](#前端) · [工具 & 运维](#工具--运维) · [外部 API](#外部-api) |
-| 配置中心 | [Pydantic Settings + @property 派生属性](#配置中心pydantic-settings) |
+- 🎯 [项目定位](#🧭-项目定位)
+- 🏗️ [系统架构](#🏗️-系统架构)
+- 🧰 [技术栈](#🧰-技术栈)
+  - ⚡ 后端框架 & 中间件 · 🤖 AI Agent 核心 · 📚 RAG 检索增强 · 💾 数据层 · 🖥️ 前端 · 🔧 工具 & 运维 · 🛠️ 外部 API
+- ⚙️ [配置中心](#⚙️-配置中心pydantic-settings)
 
-### Agent 核心设计
+</details>
 
-| 板块 | 链接 |
-|------|------|
-| 六大核心特性 | [1. Supervisor 两轮复用 + Send API](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻) · [2. RAG 双轨制](#2-rag-双轨制硬事实锁死-vs-软知识放开不是一刀切的not-prior-knowledge) · [3. validate_plan 8 条硬编码](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管) · [4. 19 万条通勤矩阵](#4-19-万条通勤矩阵让-llm-的行程时间有据可查) · [5. 六模型工厂 + Monkey-Patch](#5-六模型工厂langchain-零-patchpatch-全在-llamaindex) · [6. SSE 流式 + 4 种事件](#6-sse-流式--4-种事件类型worker-卡片先行最终汇总后推-end) |
-| LangGraph State Schema | [MultiAgentState + 自定义 reducer](#langgraph-state-schema) |
-| LLM 多模型工厂 | [六实例 + get_llm 工厂函数](#llm-多模型工厂) |
-| 四个 Worker 实现细节 | [调用总览](#worker-调用总览) · [QA Worker](#qa-worker--rag-双轨制--软知识回退) · [Plan Worker](#plan-worker--sql-动态注入--validate_plan-程序级强制) · [Advice Worker](#advice-worker--mysql-避坑规则--六维强制输出) · [Nearby Worker](#nearby-worker--bounding-box-预过滤--haversine-精算) |
+<details>
+<summary><b>✨ Agent 核心设计</b></summary>
 
-### RAG & 检索链路
+- 🎯 [1. Supervisor 两轮复用 + Send API](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)
+- 🔍 [2. RAG 双轨制](#2-rag-双轨制硬事实锁死-vs-软知识放开不是一刀切的not-prior-knowledge)
+- 🛡️ [3. validate_plan 8 条硬编码](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管)
+- 🚇 [4. 19 万条通勤矩阵](#4-19-万条通勤矩阵让-llm-的行程时间有据可查)
+- 🧩 [5. 六模型工厂 + Monkey-Patch](#5-六模型工厂langchain-零-patchpatch-全在-llamaindex)
+- 💨 [6. SSE 流式 + 4 种事件](#6-sse-流式--4-种事件类型worker-卡片先行最终汇总后推-end)
+- 🧠 [LangGraph State Schema](#🧠-langgraph-state-schema)
+- 🧩 [LLM 多模型工厂](#🧩-llm-多模型工厂)
+- 👷 [四个 Worker 实现细节](#👷-四个-worker-实现细节)
+  - 📋 调用总览 · 🔍 QA Worker · 📅 Plan Worker · 💡 Advice Worker · 📍 Nearby Worker
 
-| 板块 | 链接 |
-|------|------|
-| LlamaIndex Monkey-Patch 三部曲 | [模型注册表 + tiktoken + API 端点覆盖](#llamaindex-monkey-patch-三部曲) |
-| BGE Embedding 细节 | [Query instruction 前缀 + L2 归一化](#bge-embedding-细节) |
-| RAG 混合检索完整链路 | [Milvus 向量 + BM25 + KeywordBoost + Reranker](#rag-混合检索完整链路) |
+</details>
 
-### 后端工程
+<details>
+<summary><b>🔍 RAG & 检索链路</b></summary>
 
-| 板块 | 链接 |
-|------|------|
-| API 接口协议 | [FastAPI lifespan 启动](#fastapi-lifespan-启动流程) · [GET /health](#get-health--全链路健康检查) · [GET /api/spots](#get-apispots--景点搜索) · [GET /api/spots/{id}](#get-apispotsspot_id--景点详情) · [POST /api/chat](#post-apichat--sse-流式对话) |
-| SSE 流式事件协议 | [4 种事件 + chat_stream 源码](#sse-流式事件协议) |
-| 工具层 | [高德天气选型](#高德天气为什么选它不选-openweathermap) · [DuckDuckGo 搜索](#duckduckgo-html-搜索为什么不用-serpaping-api) · [smart_search 链路](#smart_search-完整链路) |
-| Checkpointer 工厂模式 | [四种后端 + @asynccontextmanager](#checkpointer-工厂模式) |
+- 🤯 [LlamaIndex Monkey-Patch 三部曲](#🤯-llamaindex-monkey-patch-三部曲)
+- 🎨 [BGE Embedding 细节](#🎨-bge-embedding-细节)
+- 🔍 [RAG 混合检索完整链路](#🔍-rag-混合检索完整链路)
 
-### 前端 & 数据
+</details>
 
-| 板块 | 链接 |
-|------|------|
-| 前端交互流程 | [用户输入 → SSE → 卡片渲染全链路](#前端交互流程) |
-| 前端组件细节 | [PlanCard](#plancard--行程规划卡片) · [QACard](#qacard--知识库问答卡片) · [ChatInput](#chatinput--输入框) · [App.jsx](#appjsx--主应用状态) · [vite.config.js](#viteconfigjs--sse-代理) |
-| 数据管道 | [种子数据 + query_variants + transit_matrix](#数据管道) |
-| 数据库表结构 | [spots](#spots--景点1554-条) · [transit_matrix](#transit_matrix--通勤矩阵190157-条) · [hard_rules](#hard_rules--硬规则53-条) · [user_profiles](#user_profiles--ltm-硬槽位-schema-only无业务代码读写) · [dlq](#dlq--死信队列-schema-only无写入代码) |
-| 数据种子精确数量 | [9 张表精确行数](#数据种子精确数量) |
+<details>
+<summary><b>🔌 后端工程</b></summary>
 
-### 运维 & 其他
+- 🔌 [API 接口协议](#🔌-api-接口协议)
+- 📡 [SSE 流式事件协议](#📡-sse-流式事件协议)
+- 🔧 [工具层](#🔧-工具层)
+- 🔴 [Checkpointer 工厂模式](#🔴-checkpointer-工厂模式)
 
-| 板块 | 链接 |
-|------|------|
-| 日志与运维 | [Loguru 日志系统](#loguru-日志系统loggerpy) · [MySQL 连接池](#mysql-连接池mysql_clientpy) |
-| 项目结构 | [完整目录树](#项目结构) |
-| 快速启动 | [1. 后端](#1-后端) · [2. 前端](#2-前端) |
-| 已知局限 & 后续计划 | [当前局限](#当前局限) · [后续计划](#后续计划) |
-| License | [MIT License](#license) |
+</details>
+
+<details>
+<summary><b>🖥️ 前端 & 数据</b></summary>
+
+- 🖥️ [前端交互流程](#🖥️-前端交互流程)
+- 🧩 [前端组件细节](#🧩-前端组件细节)
+- 📦 [数据管道](#📦-数据管道)
+- 🗄️ [数据库表结构](#🗄️-数据库表结构9-张表)
+- 📈 [数据种子精确数量](#📈-数据种子精确数量)
+
+</details>
+
+<details open>
+<summary><b>🚀 快速入口 & 其他</b></summary>
+
+- 🚀 [快速启动](#🚀-快速启动)
+- 📁 [项目结构](#📁-项目结构)
+- 📝 [日志与运维](#📝-日志与运维)
+- ⚠️ [已知局限 & 后续计划](#⚠️-已知局限--后续计划)
+- 📄 [License](#📄-license)
+
+</details>
 
 ---
 
