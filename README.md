@@ -13,90 +13,63 @@
 
 ---
 
-## 📑 目录
+## 📑 项目目录
 
-> 点击任意链接可跳转到对应板块。
+> 系统执行链路：**前端** → API / SSE → Supervisor → Worker / Agent → LLM / Tools → RAG → State / DB
 
 <table>
-<tr>
-<td>
+<tr valign="top">
+<td width="50%">
 
-<details>
-<summary><b>🧭 项目概述</b></summary>
+**01 项目概览**
+<sub>项目定位、整体架构与基础设施</sub>
 
-- 🎯 [项目定位](#🧭-项目定位)
-- 🏗️ [系统架构](#🏗️-系统架构)
-- 🧰 [技术栈](#🧰-技术栈)
-- ⚙️ [配置中心](#⚙️-配置中心pydantic-settings)
-
-</details>
-
-<details>
-<summary><b>✨ Agent 核心设计</b></summary>
-
-- 🎯 [1. Supervisor 两轮复用 + Send API](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)
-- 🔍 [2. RAG 双轨制](#2-rag-双轨制硬事实锁死-vs-软知识放开不是一刀切的not-prior-knowledge)
-- 🛡️ [3. validate_plan 8 条硬编码](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管)
-- 🚇 [4. 19 万条通勤矩阵](#4-19-万条通勤矩阵让-llm-的行程时间有据可查)
-- 🧩 [5. 六模型工厂 + Monkey-Patch](#5-六模型工厂langchain-零-patchpatch-全在-llamaindex)
-- 💨 [6. SSE 流式 + 4 种事件](#6-sse-流式--4-种事件类型worker-卡片先行最终汇总后推-end)
-- 🧠 [LangGraph State Schema](#🧠-langgraph-state-schema)
-- 🧩 [LLM 多模型工厂](#🧩-llm-多模型工厂)
-- 👷 [四个 Worker 实现细节](#👷-四个-worker-实现细节)
-
-</details>
+▸ [项目定位](#🧭-项目定位)
+▸ [系统架构](#🏗️-系统架构)
+▸ [技术栈](#🧰-技术栈)
+▸ [配置中心](#⚙️-配置中心pydantic-settings)
 
 </td>
-<td>
+<td width="50%">
 
-<details>
-<summary><b>🔍 RAG & 检索链路</b></summary>
+**02 Agent 核心架构**
+<sub>任务拆解、Agent 协作、模型调度与状态管理</sub>
 
-- 🤯 [LlamaIndex Monkey-Patch 三部曲](#🤯-llamaindex-monkey-patch-三部曲)
-- 🎨 [BGE Embedding 细节](#🎨-bge-embedding-细节)
-- 🔍 [RAG 混合检索完整链路](#🔍-rag-混合检索完整链路)
-
-</details>
-
-<details>
-<summary><b>🔌 后端工程</b></summary>
-
-- 🔌 [API 接口协议](#🔌-api-接口协议)
-- 📡 [SSE 流式事件协议](#📡-sse-流式事件协议)
-- 🔧 [工具层](#🔧-工具层)
-- 🔴 [Checkpointer 工厂模式](#🔴-checkpointer-工厂模式)
-
-</details>
+▸ Supervisor 调度 — [两轮复用 + Send API](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)
+▸ Worker 执行 — [四 Worker 实现](#👷-四个-worker-实现细节) · [调用总览](#worker-调用总览)
+▸ LLM 多模型工厂 — [模型工厂](#🧩-llm-多模型工厂)
+▸ State 状态管理 — [LangGraph State](#🧠-langgraph-state-schema)
+▸ RAG 检索链路 — [混合检索](#🔍-rag-混合检索完整链路) · [Embedding](#🎨-bge-embedding-细节) · [LlamaIndex 适配](#🤯-llamaindex-monkey-patch-三部曲)
+▸ Plan 校验机制 — [validate_plan 8 条规则](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管)
 
 </td>
 </tr>
-<tr>
-<td>
+<tr valign="top">
+<td width="50%">
 
-<details>
-<summary><b>🖥️ 前端 & 数据</b></summary>
+**03 服务与数据架构**
+<sub>API、流式通信、工具调用与数据持久化</sub>
 
-- 🖥️ [前端交互流程](#🖥️-前端交互流程)
-- 🧩 [前端组件细节](#🧩-前端组件细节)
-- 📦 [数据管道](#📦-数据管道)
-- 🗄️ [数据库表结构](#🗄️-数据库表结构9-张表)
-- 📈 [数据种子精确数量](#📈-数据种子精确数量)
-
-</details>
+▸ API 服务层 — [接口协议](#🔌-api-接口协议) · [健康检查](#get-health--全链路健康检查)
+▸ SSE 流式通信 — [事件协议](#📡-sse-流式事件协议)
+▸ 工具调用层 — [工具层](#🔧-工具层)
+▸ 数据管道 — [数据管道](#📦-数据管道) · [通勤矩阵](#4-19-万条通勤矩阵让-llm-的行程时间有据可查)
+▸ 状态持久化 — [Checkpointer 工厂](#🔴-checkpointer-工厂模式)
+▸ 数据库设计 — [9 张表结构](#🗄️-数据库表结构9-张表)
 
 </td>
-<td>
+<td width="50%">
 
-<details open>
-<summary><b>🚀 快速入口 & 其他</b></summary>
+**04 前端与工程**
+<sub>用户交互、数据展示、运行与工程化能力</sub>
 
-- 🚀 [快速启动](#🚀-快速启动)
-- 📁 [项目结构](#📁-项目结构)
-- 📝 [日志与运维](#📝-日志与运维)
-- ⚠️ [已知局限 & 后续计划](#⚠️-已知局限--后续计划)
-- 📄 [License](#📄-license)
-
-</details>
+▸ 前端交互 — [交互流程](#🖥️-前端交互流程)
+▸ 前端组件 — [组件细节](#🧩-前端组件细节)
+▸ 项目结构 — [目录树](#📁-项目结构)
+▸ 快速启动 — [后端](#1-后端) · [前端](#2-前端)
+▸ 日志与运维 — [日志系统](#📝-日志与运维)
+▸ 已知限制 — [局限 & 计划](#⚠️-已知局限--后续计划)
+▸ [License](#📄-license)
 
 </td>
 </tr>
@@ -105,6 +78,8 @@
 ---
 
 **一个可以跑起来的 Agent 工程化样本**——不是 Demo Toy，也不是纯论文复现。从种子数据采集、RAG 向量化、多智能体编排、SSE 流式输出到前端 Markdown 渲染，形成完整闭环。核心特色是：**把 LLM 的强项（语言理解、知识扩展、规划推理）和工程的确定性（数据校验、规则硬编码、程序级兜底）结合起来**。
+
+## 🧭 项目定位
 
 ### 🎯 解决什么问题
 
