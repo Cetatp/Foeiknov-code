@@ -1,15 +1,25 @@
-# 🏯 蓉游智体 · Chengdu Travel AI Agent
+# 🏯 蓉游智体 | Chengdu Travel AI Agent
 
-![Python](https://img.shields.io/badge/Python-3.12+-blue?logo=python)
-![Node](https://img.shields.io/badge/Node.js-19+-green?logo=node.js)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi)
-![LangGraph](https://img.shields.io/badge/LangGraph-0.2-1C3F94?logo=langchain)
-![React](https://img.shields.io/badge/React-19-61DAFB?logo=react)
-![Milvus](https://img.shields.io/badge/Milvus-Lite-00A0FF?logo=milvus)
-![MySQL](https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+<p>
+  <img src="https://img.shields.io/badge/LangGraph-Multi--Agent-blue" />
+  <img src="https://img.shields.io/badge/FastAPI-Backend-009688" />
+  <img src="https://img.shields.io/badge/React-Frontend-61DAFB" />
+  <img src="https://img.shields.io/badge/RAG-Hybrid%20Retrieval-7B61FF" />
+  <img src="https://img.shields.io/badge/Milvus-Vector%20DB-00A1EA" />
+  <img src="https://img.shields.io/badge/MySQL-Database-4479A1" />
+</p>
 
-> 蓉游智体是一个面向真实用户场景的成都旅游 AI Agent：LangGraph 驱动 Supervisor 并行调度 4 个 Worker，LlamaIndex + Milvus 提供双轨制检索增强（硬事实锁死 + 软知识按需展开），8 条程序级硬规则 + 53 条 Prompt 硬规则保障行程合理性，SSE 流式输出实时渲染 Markdown 卡片。
+> **一个面向成都旅游场景的多智能体 AI 旅行助手。**  
+> 支持旅游问答、个性化行程规划、避坑建议和周边推荐，可根据用户的多个需求自动拆解任务并协同完成。
+
+**技术亮点：** LangGraph Supervisor + 4 个专长 Worker · 混合 RAG 检索 · 结构化数据约束 · 行程规则校验 · SSE 流式响应
+
+**工程规模：** 多 Agent 协同 · MySQL + Milvus 双数据系统 · 19 万+ 通勤矩阵数据 · React / FastAPI 完整前后端
+
+[🎬 功能演示](#-功能演示) ·
+[🏗️ 系统架构](#️-系统架构) ·
+[🤖 Agent 设计](#-agent-核心架构) ·
+[🚀 快速启动](#-快速启动)
 
 ---
 
