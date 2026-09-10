@@ -13,71 +13,162 @@
 
 ---
 
-## 📑 项目目录
+## 🧭 项目导航
 
-> 系统执行链路：**前端** → API / SSE → Supervisor → Worker / Agent → LLM / Tools → RAG → State / DB
+> 🔗 **核心执行链路：**  
+> React 前端 → FastAPI / SSE → LangGraph Supervisor → Send API 并行调度 → 4 个 Worker → RAG / MySQL / Tools / LLM → Reducer 汇总 → SSE 流式返回
+>
+> 🎓 **毕业设计核心：**  
+> **多智能体协同调度** · **混合 RAG 检索** · **规则约束行程规划** · **大模型可靠性控制**
+
+<br>
 
 <table>
 <tr valign="top">
+
 <td width="50%">
 
-**01 项目概览**
-<sub>项目定位、整体架构与基础设施</sub>
+### 📘 01 · 项目与架构
 
-▸ [项目定位](#🧭-项目定位)
-▸ [系统架构](#🏗️-系统架构)
-▸ [技术栈](#🧰-技术栈)
-▸ [配置中心](#⚙️-配置中心pydantic-settings)
+<sub>项目解决什么问题，以及系统整体如何设计</sub>
+
+<br>
+
+🔹 [**项目定位**](#🧭-项目定位)  
+了解项目的应用场景、核心目标与差异化能力
+
+🔹 [**系统架构**](#🏗️-系统架构)  
+查看前端、API、多智能体、RAG 与数据层整体架构
+
+🔹 [**技术选型**](#🧰-技术栈)  
+LangGraph、FastAPI、LlamaIndex、Milvus、React 等核心技术
+
+🔹 [**数据基础**](#📊-数据规模)  
+景点、美食、避坑规则、通勤矩阵与 RAG 数据规模
 
 </td>
+
 <td width="50%">
 
-**02 Agent 核心架构**
-<sub>任务拆解、Agent 协作、模型调度与状态管理</sub>
+### 🤖 02 · Agent 核心
 
-▸ Supervisor 调度 — [两轮复用 + Send API](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)
-▸ Worker 执行 — [四 Worker 实现](#👷-四个-worker-实现细节) · [调用总览](#worker-调用总览)
-▸ LLM 多模型工厂 — [模型工厂](#🧩-llm-多模型工厂)
-▸ State 状态管理 — [LangGraph State](#🧠-langgraph-state-schema)
-▸ RAG 检索链路 — [混合检索](#🔍-rag-混合检索完整链路) · [Embedding](#🎨-bge-embedding-细节) · [LlamaIndex 适配](#🤯-llamaindex-monkey-patch-三部曲)
-▸ Plan 校验机制 — [validate_plan 8 条规则](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管)
+<sub>任务拆解、多智能体协同、RAG 与规划校验</sub>
+
+<br>
+
+🔹 [**智能体调度**](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)  
+Supervisor 意图识别、两轮复用与 Send API 并行派发
+
+🔹 [**Worker 协同**](#👷-四个-worker-实现细节)  
+QA / Plan / Advice / Nearby 四个专长 Worker 分工协作
+
+🔹 [**知识增强**](#🔍-rag-混合检索完整链路)  
+向量检索 + BM25 + Reranker + KeywordBoost 混合 RAG
+
+🔹 [**规划可靠性**](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管)  
+Prompt 规则 + Python 硬规则 + validate_plan 程序级校验
 
 </td>
+
 </tr>
+
 <tr valign="top">
+
 <td width="50%">
 
-**03 服务与数据架构**
-<sub>API、流式通信、工具调用与数据持久化</sub>
+### 🗄️ 03 · 服务与数据
 
-▸ API 服务层 — [接口协议](#🔌-api-接口协议) · [健康检查](#get-health--全链路健康检查)
-▸ SSE 流式通信 — [事件协议](#📡-sse-流式事件协议)
-▸ 工具调用层 — [工具层](#🔧-工具层)
-▸ 数据管道 — [数据管道](#📦-数据管道) · [通勤矩阵](#4-19-万条通勤矩阵让-llm-的行程时间有据可查)
-▸ 状态持久化 — [Checkpointer 工厂](#🔴-checkpointer-工厂模式)
-▸ 数据库设计 — [9 张表结构](#🗄️-数据库表结构9-张表)
+<sub>API、流式通信、工具调用、数据库与状态持久化</sub>
+
+<br>
+
+🔹 [**服务通信**](#🔌-api-接口协议)  
+FastAPI 接口设计、健康检查与 SSE 流式事件协议
+
+🔹 [**工具调用**](#🔧-工具层)  
+天气查询、联网搜索与外部能力调用
+
+🔹 [**数据系统**](#🗄️-数据库表结构9-张表)  
+MySQL 业务数据、规则数据与通勤矩阵持久化
+
+🔹 [**状态管理**](#🔴-checkpointer-工厂模式)  
+LangGraph Checkpointer 与请求级 State 隔离
 
 </td>
+
 <td width="50%">
 
-**04 前端与工程**
-<sub>用户交互、数据展示、运行与工程化能力</sub>
+### 🖥️ 04 · 前端与工程
 
-▸ 前端交互 — [交互流程](#🖥️-前端交互流程)
-▸ 前端组件 — [组件细节](#🧩-前端组件细节)
-▸ 项目结构 — [目录树](#📁-项目结构)
-▸ 快速启动 — [后端](#1-后端) · [前端](#2-前端)
-▸ 日志与运维 — [日志系统](#📝-日志与运维)
-▸ 已知限制 — [局限 & 计划](#⚠️-已知局限--后续计划)
-▸ [License](#📄-license)
+<sub>交互展示、项目结构、运行方式与工程化能力</sub>
+
+<br>
+
+🔹 [**用户交互**](#🖥️-前端交互流程)  
+聊天模式、SSE 消费、会话管理与结构化卡片展示
+
+🔹 [**工程结构**](#📁-项目结构)  
+前后端目录划分以及 Agent / RAG / Service 模块组织
+
+🔹 [**运行项目**](#🚀-快速启动)  
+环境配置、数据初始化以及前后端启动方式
+
+🔹 [**工程完善**](#📝-日志与运维)  
+日志、异常降级、运行维护与后续优化方向
 
 </td>
+
 </tr>
 </table>
 
+<br>
+
+<details>
+
+<summary><b>📚 展开完整技术索引</b></summary>
+
+<br>
+
+### 🤖 Agent / LLM
+
+[Supervisor 调度](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)
+· [四 Worker 实现](#👷-四个-worker-实现细节)
+· [Worker 调用总览](#-worker-调用总览)
+· [LLM 多模型工厂](#🧩-llm-多模型工厂)
+· [LangGraph State](#🧠-langgraph-state-schema)
+
+### 📚 RAG / Knowledge
+
+[混合检索链路](#🔍-rag-混合检索完整链路)
+· [BGE Embedding](#🎨-bge-embedding-细节)
+· [LlamaIndex 适配](#🤯-llamaindex-monkey-patch-三部曲)
+
+### 🗄️ Data / Infrastructure
+
+[API 接口](#🔌-api-接口协议)
+· [SSE 事件协议](#📡-sse-流式事件协议)
+· [工具层](#🔧-工具层)
+· [数据管道](#📦-数据管道)
+· [数据库设计](#🗄️-数据库表结构9-张表)
+· [Checkpointer](#🔴-checkpointer-工厂模式)
+
+### 🖥️ Frontend / Engineering
+
+[前端交互](#🖥️-前端交互流程)
+· [前端组件](#🧩-前端组件细节)
+· [项目结构](#📁-项目结构)
+· [快速启动](#🚀-快速启动)
+· [日志与运维](#📝-日志与运维)
+· [已知局限](#⚠️-已知局限--后续计划)
+
+</details>
+
 ---
 
-**一个可以跑起来的 Agent 工程化样本**——不是 Demo Toy，也不是纯论文复现。从种子数据采集、RAG 向量化、多智能体编排、SSE 流式输出到前端 Markdown 渲染，形成完整闭环。核心特色是：**把 LLM 的强项（语言理解、知识扩展、规划推理）和工程的确定性（数据校验、规则硬编码、程序级兜底）结合起来**。
+> 💡 **项目定位**
+>
+> 蓉游智体并非简单的旅游问答 Demo，而是一个围绕 **多智能体协同、知识增强检索与约束式行程规划** 构建的完整 AI Agent 系统。  
+> 系统通过 LangGraph Supervisor 对用户意图进行识别与任务拆解，将不同任务并行派发给专长 Worker，并结合 RAG、结构化数据库与程序级规则校验完成旅游问答、行程规划、避坑建议及周边推荐，在发挥大语言模型推理能力的同时，通过工程化约束降低幻觉和不合理规划。
 
 ## 🧭 项目定位
 
