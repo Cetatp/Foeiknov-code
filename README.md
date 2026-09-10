@@ -16,10 +16,11 @@
 ## 🧭 项目导航
 
 > 🔗 **核心执行链路：**  
-> React 前端 → FastAPI / SSE → LangGraph Supervisor → Send API 并行调度 → 4 个 Worker → RAG / MySQL / Tools / LLM → Reducer 汇总 → SSE 流式返回
+> React → FastAPI / SSE → LangGraph Supervisor → Send API 并行调度  
+> → 4 个 Worker → RAG / MySQL / Tools / LLM → Reducer 汇总 → SSE 流式返回
 >
-> 🎓 **毕业设计核心：**  
-> **多智能体协同调度** · **混合 RAG 检索** · **规则约束行程规划** · **大模型可靠性控制**
+> ⭐ **项目亮点：**  
+> **LangGraph 多智能体协同** · **混合 RAG 检索** · **约束式行程规划** · **多模型适配** · **完整前后端工程化**
 
 <br>
 
@@ -28,23 +29,23 @@
 
 <td width="50%">
 
-### 📘 01 · 项目与架构
+### 🚀 01 · 项目概览
 
-<sub>项目解决什么问题，以及系统整体如何设计</sub>
+<sub>快速了解这个项目解决什么问题、提供什么能力</sub>
 
 <br>
 
 🔹 [**项目定位**](#🧭-项目定位)  
-了解项目的应用场景、核心目标与差异化能力
+面向成都旅游场景构建的多智能体 AI Agent 系统
+
+🔹 [**核心能力**](#✨-核心能力)  
+旅游问答、行程规划、避坑建议、周边推荐
 
 🔹 [**系统架构**](#🏗️-系统架构)  
-查看前端、API、多智能体、RAG 与数据层整体架构
+查看前端、服务层、Agent、RAG 与数据层完整链路
 
-🔹 [**技术选型**](#🧰-技术栈)  
-LangGraph、FastAPI、LlamaIndex、Milvus、React 等核心技术
-
-🔹 [**数据基础**](#📊-数据规模)  
-景点、美食、避坑规则、通勤矩阵与 RAG 数据规模
+🔹 [**技术栈**](#🧰-技术栈)  
+LangGraph、FastAPI、LlamaIndex、Milvus、React 等
 
 </td>
 
@@ -52,21 +53,21 @@ LangGraph、FastAPI、LlamaIndex、Milvus、React 等核心技术
 
 ### 🤖 02 · Agent 核心
 
-<sub>任务拆解、多智能体协同、RAG 与规划校验</sub>
+<sub>项目中最核心的 AI Agent 与大模型能力</sub>
 
 <br>
 
-🔹 [**智能体调度**](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)  
-Supervisor 意图识别、两轮复用与 Send API 并行派发
+🔹 [**Supervisor 调度**](#1-supervisor-两轮复用--send-api-并行比多-agent-框架更轻)  
+意图识别、任务拆解以及 Send API 并行调度
 
 🔹 [**Worker 协同**](#👷-四个-worker-实现细节)  
-QA / Plan / Advice / Nearby 四个专长 Worker 分工协作
+QA / Plan / Advice / Nearby 四个专长 Agent 分工协作
 
-🔹 [**知识增强**](#🔍-rag-混合检索完整链路)  
-向量检索 + BM25 + Reranker + KeywordBoost 混合 RAG
+🔹 [**混合 RAG**](#🔍-rag-混合检索完整链路)  
+Embedding + BM25 + Reranker + KeywordBoost 检索链路
 
 🔹 [**规划可靠性**](#3-validate_plan-8-条-python-硬编码prompt-管不住的用代码管)  
-Prompt 规则 + Python 硬规则 + validate_plan 程序级校验
+Prompt + 结构化数据 + Python 规则降低模型幻觉
 
 </td>
 
@@ -76,45 +77,45 @@ Prompt 规则 + Python 硬规则 + validate_plan 程序级校验
 
 <td width="50%">
 
-### 🗄️ 03 · 服务与数据
+### ⚙️ 03 · 工程实现
 
-<sub>API、流式通信、工具调用、数据库与状态持久化</sub>
+<sub>从 Agent Demo 到完整应用的工程化能力</sub>
 
 <br>
 
-🔹 [**服务通信**](#🔌-api-接口协议)  
-FastAPI 接口设计、健康检查与 SSE 流式事件协议
+🔹 [**API & SSE**](#🔌-api-接口协议)  
+FastAPI 接口、SSE 流式输出与事件协议
 
-🔹 [**工具调用**](#🔧-工具层)  
-天气查询、联网搜索与外部能力调用
+🔹 [**Tools**](#🔧-工具层)  
+天气、搜索以及外部工具调用能力
 
 🔹 [**数据系统**](#🗄️-数据库表结构9-张表)  
-MySQL 业务数据、规则数据与通勤矩阵持久化
+MySQL、Milvus、知识库与通勤矩阵
 
 🔹 [**状态管理**](#🔴-checkpointer-工厂模式)  
-LangGraph Checkpointer 与请求级 State 隔离
+LangGraph State、Reducer 与 Checkpointer 持久化
 
 </td>
 
 <td width="50%">
 
-### 🖥️ 04 · 前端与工程
+### 💻 04 · 运行与工程质量
 
-<sub>交互展示、项目结构、运行方式与工程化能力</sub>
+<sub>前端交互、项目组织、可运行性与工程设计</sub>
 
 <br>
 
-🔹 [**用户交互**](#🖥️-前端交互流程)  
-聊天模式、SSE 消费、会话管理与结构化卡片展示
+🔹 [**前端交互**](#🖥️-前端交互流程)  
+React 聊天界面、SSE 消费与结构化结果展示
 
-🔹 [**工程结构**](#📁-项目结构)  
-前后端目录划分以及 Agent / RAG / Service 模块组织
+🔹 [**项目结构**](#📁-项目结构)  
+Agent / RAG / Service / Data 等模块化组织
 
-🔹 [**运行项目**](#🚀-快速启动)  
-环境配置、数据初始化以及前后端启动方式
+🔹 [**快速启动**](#🚀-快速启动)  
+环境配置、数据初始化与前后端运行方式
 
-🔹 [**工程完善**](#📝-日志与运维)  
-日志、异常降级、运行维护与后续优化方向
+🔹 [**日志与运维**](#📝-日志与运维)  
+日志、异常处理、降级机制与运行维护
 
 </td>
 
@@ -137,16 +138,17 @@ LangGraph Checkpointer 与请求级 State 隔离
 · [LLM 多模型工厂](#🧩-llm-多模型工厂)
 · [LangGraph State](#🧠-langgraph-state-schema)
 
-### 📚 RAG / Knowledge
+### 🔍 RAG / Knowledge
 
-[混合检索链路](#🔍-rag-混合检索完整链路)
+[混合检索](#🔍-rag-混合检索完整链路)
 · [BGE Embedding](#🎨-bge-embedding-细节)
 · [LlamaIndex 适配](#🤯-llamaindex-monkey-patch-三部曲)
+· [通勤矩阵](#4-19-万条通勤矩阵让-llm-的行程时间有据可查)
 
-### 🗄️ Data / Infrastructure
+### ⚙️ Backend / Infrastructure
 
 [API 接口](#🔌-api-接口协议)
-· [SSE 事件协议](#📡-sse-流式事件协议)
+· [SSE 协议](#📡-sse-流式事件协议)
 · [工具层](#🔧-工具层)
 · [数据管道](#📦-数据管道)
 · [数据库设计](#🗄️-数据库表结构9-张表)
@@ -164,11 +166,6 @@ LangGraph Checkpointer 与请求级 State 隔离
 </details>
 
 ---
-
-> 💡 **项目定位**
->
-> 蓉游智体并非简单的旅游问答 Demo，而是一个围绕 **多智能体协同、知识增强检索与约束式行程规划** 构建的完整 AI Agent 系统。  
-> 系统通过 LangGraph Supervisor 对用户意图进行识别与任务拆解，将不同任务并行派发给专长 Worker，并结合 RAG、结构化数据库与程序级规则校验完成旅游问答、行程规划、避坑建议及周边推荐，在发挥大语言模型推理能力的同时，通过工程化约束降低幻觉和不合理规划。
 
 ## 🧭 项目定位
 
