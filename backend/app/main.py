@@ -1,5 +1,5 @@
 """
-FastAPI 后端入口 — 阶段 7
+FastAPI 后端入口
 
 技术要点：
 - CORS 精确白名单 http://localhost:5173（不能 * + allow_credentials）
