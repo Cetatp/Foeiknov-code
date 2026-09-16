@@ -126,9 +126,7 @@ def build_qa_prompt(query: str, context_str: str) -> str:
     return QA_BASE_PROMPT + "\n\n" + soft_block
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 阶段 6：LangGraph 多智能体 Prompt
-# ═══════════════════════════════════════════════════════════════════
+# ── LangGraph 多智能体 Prompt ──
 
 # ── Supervisor：多意图分类 ──
 SUPERVISOR_PROMPT = """你是蓉游智体多智能体系统的调度员（Supervisor）。
